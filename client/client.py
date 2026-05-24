@@ -12,4 +12,3 @@ if __name__ == "__main__":
         dataRec = clientSocket.recvfrom(1024)
         print("data recieved: ", dataRec)
         time.sleep(1)
-    
