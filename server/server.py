@@ -1,6 +1,7 @@
 import inspect
 import json
 import socket
+import time
 
 DEBUG = 1
 
@@ -11,7 +12,7 @@ def hello(name: str) -> str:
 
 
 def parse_data(packet):
-    obj = json.loads(packet)
+    obj = json.loads(packet.decode("utf-8"))
     return obj
 
 
@@ -36,7 +37,7 @@ def evaluate_command(cmd, args):
     if cmd not in schema:
         raise ValueError(f"{cmd} no in schema")
     func = schema[cmd]["function"]
-    sig = inspect.signature(cmd)
+    sig = inspect.signature(func)
     try:
         sig.bind(*args)
     except TypeError as e:
@@ -44,7 +45,21 @@ def evaluate_command(cmd, args):
     return func(*args)
 
 def generate_response(packet):
-    pass 
+    response = {
+            "type": "response",
+            "timestamp": time.time(),
+            "sequence_no": packet["sequence_no"],
+            "status_code": 500,
+            "result": None,
+            "error": None,
+            }
+    try:
+        response["result"] = evaluate_command(packet["cmd"], packet.get("args", []))
+        response["status_code"] = 200
+    except ValueError as e:
+        response["error"] = f'error: {e}\n'
+        response["status_code"] = 500
+    return response
 
 def info():
     return json.dumps(schema)
@@ -59,9 +74,27 @@ if __name__ == "__main__":
         print(serversocket)
     while True:
         data, addr = serversocket.recvfrom(1024)
-        packet = parse_data(data)
-        if packet["type"] == "command":
-            response = generate_response(packet)
-            serversocket.sendto(response, addr)
-
+        try:
+            packet = parse_data(data)
+            if packet["type"] == "command":
+                response = generate_response(packet)
+            else:
+                response = {
+                    "type": "response",
+                    "timestamp": time.time(),
+                    "sequence_no": packet.get("sequence_no"),
+                    "status_code": 400,
+                    "result": None,
+                    "error": "unsupported packet type",
+                }
+        except Exception as e:
+            response = {
+                "type": "response",
+                "timestamp": time.time(),
+                "sequence_no": packet["sequence_no"],
+                "status_code": 500,
+                "result": None,
+                "error": f'bad packet {e}',
+            }
+        serversocket.sendto(json.dumps(response).encode("utf-8"),  addr)
 
