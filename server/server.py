@@ -36,7 +36,7 @@ schema = {
 def evaluate_command(cmd, args):
     if cmd not in schema:
         raise ValueError(f"{cmd} no in schema")
-    func = schema[cmd]["function"]
+    func = schema.get(cmd, {}).get("function")
     sig = inspect.signature(func)
     try:
         sig.bind(*args)
@@ -48,13 +48,13 @@ def generate_response(packet):
     response = {
             "type": "response",
             "timestamp": time.time(),
-            "sequence_no": packet["sequence_no"],
+            "sequence_no": packet.get("sequence_no", -1),
             "status_code": 500,
             "result": None,
             "error": None,
             }
     try:
-        response["result"] = evaluate_command(packet["cmd"], packet.get("args", []))
+        response["result"] = evaluate_command(packet.get("cmd"), packet.get("args", []))
         response["status_code"] = 200
     except ValueError as e:
         response["error"] = f'error: {e}\n'
@@ -76,13 +76,13 @@ if __name__ == "__main__":
         data, addr = serversocket.recvfrom(1024)
         try:
             packet = parse_data(data)
-            if packet["type"] == "command":
+            if packet.get("type") == "command":
                 response = generate_response(packet)
             else:
                 response = {
                     "type": "response",
                     "timestamp": time.time(),
-                    "sequence_no": packet.get("sequence_no"),
+                    "sequence_no": packet.get("sequence_no", -1),
                     "status_code": 400,
                     "result": None,
                     "error": "unsupported packet type",
@@ -91,7 +91,7 @@ if __name__ == "__main__":
             response = {
                 "type": "response",
                 "timestamp": time.time(),
-                "sequence_no": packet["sequence_no"],
+                "sequence_no": -1,
                 "status_code": 500,
                 "result": None,
                 "error": f'bad packet {e}',
