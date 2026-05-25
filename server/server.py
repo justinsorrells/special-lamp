@@ -106,5 +106,8 @@ if __name__ == "__main__":
                 "result": None,
                 "error": f'bad packet {e}',
             }
-        serversocket.sendto(json.dumps(response).encode("utf-8"),  addr)
+        try:
+            serversocket.sendto(json.dumps(response).encode("utf-8"),  addr)
+        except Exception:
+            continue
 

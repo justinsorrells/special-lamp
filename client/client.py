@@ -21,8 +21,9 @@ class UDPClient:
 
     def __init__(self, addr):
         self.addr = addr  # (HOSTNAME, PORT)
-        self.cmd = None
         self.args = None
+        self.cmd = None
+        self.dropped = 0
         self.hostname = None
         self.last_ack = 0
         self.output = None  # dict[str, Any]
@@ -51,6 +52,7 @@ class UDPClient:
             data, addr = await self._receive()
         except asyncio.TimeoutError:
             print(f'packet_no: {self.sequence_no} timed out')
+            self.dropped += 1
             return None
         data = self._decode(data)
         if data.get("status_code") == 200:
@@ -78,7 +80,10 @@ class UDPClient:
 
     async def _send(self, packet):
         loop = asyncio.get_running_loop()
-        await loop.sock_sendto(self.socket, packet, self.addr)
+        try:
+            await loop.sock_sendto(self.socket, packet, self.addr)
+        except Exception:
+            print(f'send to {self.addr} failed...')
 
     async def send_command(self, timeout=0.5):
         if time.monotonic() - self.timestamp > self.threshold or self.schema == None:
@@ -99,6 +104,7 @@ class UDPClient:
             data, addr = await self._receive(timeout)
         except asyncio.TimeoutError:
             print(f'packet_no: {seq} timed out')
+            self.dropped += 1
             return None
         data = self._decode(data)
         if data["sequence_no"] > self.last_ack:
@@ -112,9 +118,17 @@ class UDPClient:
         self.args = args
 
 
-async def command_updater(clients):
-    while True:
+async def command_updater(clients, stop):
+    while not stop.is_set():
         target = await asyncio.to_thread(input, "client id> ")
+        if target in {"exit", "quit", "q"}:
+            total = sum(client.sequence_no for client in clients.values())
+            dropped = sum(client.dropped for client in clients.values())
+            print(f'Total: {total}')
+            print(f'Dropped: {dropped}')
+            print(f'Percent recevied: {(total - dropped) / total}')
+            stop.set()
+            return 
         cmd = await asyncio.to_thread(input, "cmd> ")
         args = await asyncio.to_thread(input, "args> ")
         try:
@@ -126,29 +140,30 @@ async def command_updater(clients):
         client.set_command(cmd, args.split())
 
 
-async def flood(client, hz=50):
+async def flood(client, stop, hz=50):
     interval = 1.0 / hz
-    while True:
+    while not stop.is_set():
         res = await client.send_command(timeout=0.02)
         print(f'{client.hostname}: {res}')
         await asyncio.sleep(interval)
 
 
 async def main():
+    start = time.monotonic()
+    stop = asyncio.Event()
     clients = {
-        1: UDPClient(("127.0.0.1", 6767)),
-        2: UDPClient(("127.0.0.1", 6768)),
-        3: UDPClient(("127.0.0.1", 6767)),
+        1: UDPClient(("192.168.10.188", 6767)),
+        2: UDPClient(("192.168.10.197", 6767)),
     }
     for idx,client in enumerate(clients.values()):
         client.set_command("info", [])
         client.hostname = idx+1
 
     await asyncio.gather(
-        *(flood(client, hz=10) for client in clients.values()),
-        command_updater(clients),
+        *(flood(client, stop, hz=10000000) for client in clients.values()),
+        command_updater(clients, stop),
     )
-
+    print(time.monotonic() - start)
 
 if __name__ == "__main__":
     asyncio.run(main())
