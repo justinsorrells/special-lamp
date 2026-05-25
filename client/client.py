@@ -160,7 +160,7 @@ async def main():
         client.hostname = idx+1
 
     await asyncio.gather(
-        *(flood(client, stop, hz=10000000) for client in clients.values()),
+        *(flood(client, stop, hz=1) for client in clients.values()),
         command_updater(clients, stop),
     )
     print(time.monotonic() - start)

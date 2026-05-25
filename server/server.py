@@ -5,7 +5,7 @@ import time
 from typing import Any, TypedDict, Callable
 
 DEBUG = 1
-HOSTNAME = "big_boi"
+HOSTNAME = "justin"
 
 class CommandMeta(TypedDict):
     function: Callable[...,Any]
@@ -71,8 +71,10 @@ def generate_response(packet):
     return response
 
 def info() -> dict[str, list[Any]]:
-    return { "functions": generate_public_schema() }
-
+    return { 
+            "functions": generate_public_schema(),
+            "hostname": HOSTNAME,
+    }
 
 if __name__ == "__main__":
     schema["info"]["function"] = info  # inject info command into schema
