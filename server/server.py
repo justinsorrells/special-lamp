@@ -2,8 +2,14 @@ import inspect
 import json
 import socket
 import time
+from typing import Any, TypedDict, Callable
 
 DEBUG = 1
+HOSTNAME = "big_boi"
+
+class CommandMeta(TypedDict):
+    function: Callable[...,Any]
+    args: list[str]
 
 
 def hello(name: str) -> str:
@@ -11,14 +17,12 @@ def hello(name: str) -> str:
     return f"Hello, {name}"
 
 
-def parse_data(packet):
-    obj = json.loads(packet.decode("utf-8"))
-    return obj
+def parse_data(packet: bytes) -> dict[str, Any]:
+    return json.loads(packet.decode('utf-8'))    
 
-
-schema = {
+schema: dict[str, CommandMeta] = {
     "info": {
-        "function": None,
+        "function": lambda: None,
         "args": [],
     },
     "hello": {
@@ -27,42 +31,47 @@ schema = {
     },
 }
 
-#timestamps
-#sequence_number
-#status_code
-#cmd_output
-#error
+def generate_public_schema():
+    return { func_name: schema[func_name]['args'] for func_name in schema.keys() }
 
-def evaluate_command(cmd, args):
+def evaluate_command(cmd: str, args: list[Any]) -> Any:
     if cmd not in schema:
-        raise ValueError(f"{cmd} no in schema")
-    func = schema.get(cmd, {}).get("function")
-    sig = inspect.signature(func)
+        raise ValueError(f"{cmd} not in schema")
+    func = schema[cmd]["function"]
     try:
+        sig = inspect.signature(func)
         sig.bind(*args)
     except TypeError as e:
-        raise ValueError(f"bad arguments for {cmd}: {e}")
+        raise ValueError(f"bad arguments for {cmd}: {e}") 
     return func(*args)
 
 def generate_response(packet):
+    if not isinstance(packet, dict):
+        raise ValueError('malformed packet')
     response = {
             "type": "response",
-            "timestamp": time.time(),
+            "timestamp": packet.get("timestamp", -1),
             "sequence_no": packet.get("sequence_no", -1),
             "status_code": 500,
             "result": None,
             "error": None,
             }
+    cmd = packet.get("cmd")
+    if not isinstance(cmd, str):
+        raise ValueError("invalid or missing cmd")
+    args = packet.get("args", [])
+    if not isinstance(args, list):
+        raise ValueError("invalid or missing args") 
     try:
-        response["result"] = evaluate_command(packet.get("cmd"), packet.get("args", []))
+        response["result"] = evaluate_command(cmd, args)
         response["status_code"] = 200
     except ValueError as e:
         response["error"] = f'error: {e}\n'
         response["status_code"] = 500
     return response
 
-def info():
-    return json.dumps(schema)
+def info() -> dict[str, list[Any]]:
+    return { "functions": generate_public_schema() }
 
 
 if __name__ == "__main__":
@@ -77,6 +86,7 @@ if __name__ == "__main__":
         try:
             packet = parse_data(data)
             if packet.get("type") == "command":
+                print(packet['cmd'])
                 response = generate_response(packet)
             else:
                 response = {
