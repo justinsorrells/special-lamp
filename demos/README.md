@@ -52,6 +52,28 @@ python demos/webapp.py
 The webapp requires the packages in `requirements.txt`, including FastAPI and
 Uvicorn.
 
+## Local-Loop Integration Demo/Test
+
+The contract-aligned local loop is exercised by an integration test rather than
+the older prototype demos. It starts a fake local client, the real Unix socket
+server, the real controller core, the real board TCP connection layer, and an
+asyncio fake board TCP server:
+
+```text
+fake local client -> Unix socket -> real controller -> TCP -> fake board server
+```
+
+Run it from the repository root:
+
+```sh
+python3 -m unittest tests.test_local_loop_integration
+```
+
+The test covers one successful command round trip, newline JSON framing on both
+socket hops, distinct client `seq` vs controller-owned `board_seq`, malformed
+local input, board disconnect, board timeout, late board response drop,
+`BOARD_BUSY`, and the e-stop command gate.
+
 ## Architecture Status
 
 The demos currently model earlier prototypes, not the final intended
@@ -88,4 +110,3 @@ architecture. In particular:
 - Robustness differs: malformed messages are caught in places, but line limits,
   structured validation, disconnect handling, and local-client backpressure do
   not match v1.
-
