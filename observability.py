@@ -50,6 +50,7 @@ class ObservabilityQueue:
     def __init__(self, *, maxsize: int = DEFAULT_OBS_QUEUE_SIZE):
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=maxsize)
         self.counters = ObservabilityCounters()
+        self._next_state_event_id = 1
 
     def enqueue(self, record: dict[str, Any]) -> bool:
         try:
@@ -66,10 +67,20 @@ class ObservabilityQueue:
             return True
 
     def enqueue_board_state(self, state: BoardState) -> bool:
-        return self.enqueue(serialize_board_state_snapshot(state))
+        return self.enqueue(
+            serialize_board_state_snapshot(
+                state,
+                event_id=self._state_event_id(),
+            )
+        )
 
     def enqueue_system_state(self, state: SystemState) -> bool:
-        return self.enqueue(serialize_system_state_snapshot(state))
+        return self.enqueue(
+            serialize_system_state_snapshot(
+                state,
+                event_id=self._state_event_id(),
+            )
+        )
 
     def enqueue_board_telemetry(self, message: dict[str, Any]) -> bool:
         return self.enqueue(serialize_board_telemetry(message))
@@ -99,6 +110,11 @@ class ObservabilityQueue:
                 command=command,
             )
         )
+
+    def _state_event_id(self) -> int:
+        event_id = self._next_state_event_id
+        self._next_state_event_id += 1
+        return event_id
 
 
 class RedisTelemetryWorker:
@@ -175,27 +191,36 @@ class RedisTelemetryWorker:
             )
 
 
-def serialize_board_state_snapshot(state: BoardState) -> dict[str, Any]:
+def serialize_board_state_snapshot(state: BoardState, *, event_id: int | None = None) -> dict[str, Any]:
     record = BoardStateRecord.from_board_state(state)
     payload = record.as_hash()
+    if event_id is None:
+        event_id = 0
     return {
         "kind": "board_state",
         "key": f"board:state:{record.board_id}",
         "channel": "board:state:updates",
         "hash": payload,
-        "message": {"type": "board_state", "board_id": record.board_id, "state": payload},
+        "message": {
+            "type": "board_state",
+            "event_id": event_id,
+            "board_id": record.board_id,
+            "state": payload,
+        },
     }
 
 
-def serialize_system_state_snapshot(state: SystemState) -> dict[str, Any]:
+def serialize_system_state_snapshot(state: SystemState, *, event_id: int | None = None) -> dict[str, Any]:
     record = SystemStateRecord.from_system_state(state)
     payload = record.as_hash()
+    if event_id is None:
+        event_id = 0
     return {
         "kind": "system_state",
         "key": "system:state",
         "channel": "board:state:updates",
         "hash": payload,
-        "message": {"type": "system_state", "state": payload},
+        "message": {"type": "system_state", "event_id": event_id, "state": payload},
     }
 
 

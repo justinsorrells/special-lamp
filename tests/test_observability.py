@@ -1,4 +1,5 @@
 import asyncio
+import json
 import unittest
 
 from controller import ControllerCore
@@ -126,6 +127,29 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
         self.assertEqual(serialize_board_state_snapshot(controller.state.boards["motor"])["key"], "board:state:motor")
+
+    async def test_state_update_publish_payloads_include_monotonic_event_ids(self):
+        obs = ObservabilityQueue(maxsize=20)
+        redis = FakeRedis()
+        worker = RedisTelemetryWorker(redis=redis, obs_queue=obs)
+        worker.start()
+        controller = ControllerCore(expected_boards={"motor"}, observability=obs)
+        writer = FakeBoardWriter()
+
+        controller.set_board_state("motor", BoardConnState.CONNECTING)
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+        await self.wait_for(lambda: len(redis.publishes) >= 4)
+        await worker.stop()
+
+        state_updates = [
+            json.loads(message)
+            for channel, message in redis.publishes
+            if channel == "board:state:updates"
+        ]
+        event_ids = [message["event_id"] for message in state_updates]
+        self.assertEqual(event_ids, sorted(event_ids))
+        self.assertEqual(event_ids, list(range(1, len(event_ids) + 1)))
+        self.assertTrue({"board_state", "system_state"}.issubset({message["type"] for message in state_updates}))
 
     async def test_command_lifecycle_event_includes_required_fields(self):
         obs = ObservabilityQueue(maxsize=20)
