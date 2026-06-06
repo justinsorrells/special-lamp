@@ -181,7 +181,9 @@ class BoardTCPConnection:
             board = self.controller.state.boards[self.endpoint.board_id]
             board.last_telemetry = message["telemetry"]
             board.last_seen = asyncio.get_running_loop().time()
+            self.controller.observe_board_telemetry(message)
         elif message_type == MessageType.EVENT.value:
+            self.controller.observe_controller_event(message)
             await self._handle_event(message)
         elif message_type == MessageType.SCHEMA.value:
             # A reconnect schema is handled by establishing a fresh connection.
@@ -191,5 +193,6 @@ class BoardTCPConnection:
         board = self.controller.state.boards[self.endpoint.board_id]
         if is_estop_ack_event(message):
             board.mark_estop_ack()
+            self.controller.observe_board_state_snapshot(self.endpoint.board_id)
         elif message.get("event") == "estop_triggered":
             await self.controller.trigger_estop(origin_board=message.get("source"))

@@ -64,9 +64,11 @@ class ControllerCore:
         fifo_depth: int = DEFAULT_COMMAND_FIFO_DEPTH,
         default_execution_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S,
         default_queue_residency_cap_s: float = DEFAULT_QUEUE_RESIDENCY_CAP_S,
+        observability: Any | None = None,
     ):
         self.state = ControllerState()
         self.counters = ControllerCounters()
+        self.observability = observability
         self.fifo_depth = fifo_depth
         self.default_execution_timeout_s = default_execution_timeout_s
         self.default_queue_residency_cap_s = default_queue_residency_cap_s
@@ -100,11 +102,15 @@ class ControllerCore:
         runtime.state.conn_state = BoardConnState.REGISTERED
         runtime.state.queue_depth = len(runtime.fifo)
         self.state.refresh_connected_count()
+        self._observe_board_state(runtime.state)
+        self._observe_system_state()
 
     def set_board_state(self, board_id: str, conn_state: BoardConnState) -> None:
         runtime = self._boards[board_id]
         runtime.state.conn_state = conn_state
         self.state.refresh_connected_count()
+        self._observe_board_state(runtime.state)
+        self._observe_system_state()
 
     async def route_command(
         self,
@@ -120,37 +126,45 @@ class ControllerCore:
 
         runtime = self._boards.get(board_id)
         if runtime is None:
-            return build_error_response(
+            response = build_error_response(
                 seq=client_seq,
                 target=client_target,
                 code=ErrorCode.UNKNOWN_TARGET,
                 message=f"unknown board {board_id}",
             )
+            self._observe_command_lifecycle(command, response, board_id=board_id)
+            return response
         if runtime.writer is None or runtime.state.conn_state is not BoardConnState.REGISTERED:
-            return build_error_response(
+            response = build_error_response(
                 seq=client_seq,
                 target=client_target,
                 code=ErrorCode.BOARD_UNAVAILABLE,
                 message=f"board {board_id} is unavailable",
             )
+            self._observe_command_lifecycle(command, response, board_id=board_id)
+            return response
 
         reject = self._reject_for_schema_or_estop(runtime, command)
         if reject is not None:
-            return build_error_response(
+            response = build_error_response(
                 seq=client_seq,
                 target=client_target,
                 code=reject,
                 message=f"command {command['command']} rejected with {reject.value}",
             )
+            self._observe_command_lifecycle(command, response, board_id=board_id)
+            return response
 
         if runtime.state.in_flight_board_seq is not None and len(runtime.fifo) >= self.fifo_depth:
             self.counters.board_busy_rejections += 1
-            return build_error_response(
+            response = build_error_response(
                 seq=client_seq,
                 target=client_target,
                 code=ErrorCode.BOARD_BUSY,
                 message=f"board {board_id} command FIFO is full",
             )
+            self._observe_command_lifecycle(command, response, board_id=board_id)
+            return response
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[dict[str, Any]] = loop.create_future()
@@ -175,6 +189,7 @@ class ControllerCore:
         )
         runtime.fifo.append(pending)
         runtime.state.queue_depth = len(runtime.fifo)
+        self._observe_board_state(runtime.state)
         await self._dispatch_next(board_id)
         return await future
 
@@ -190,6 +205,7 @@ class ControllerCore:
         runtime = self._boards[entry.board_id]
         if runtime.state.in_flight_board_seq == board_seq:
             runtime.state.in_flight_board_seq = None
+            self._observe_board_state(runtime.state)
 
         latency_ms = None
         if entry.written_at is not None:
@@ -201,6 +217,12 @@ class ControllerCore:
             board_seq=board_seq,
             latency_ms=latency_ms,
         )
+        self._observe_command_lifecycle(
+            entry.command,
+            client_response,
+            board_id=entry.board_id,
+            board_seq=board_seq,
+        )
         if not entry.future.done():
             entry.future.set_result(client_response)
         await self._dispatch_next(entry.board_id)
@@ -211,6 +233,16 @@ class ControllerCore:
         runtime.state.conn_state = BoardConnState.FAULTED
         runtime.writer = None
         self.state.refresh_connected_count()
+        self._observe_board_state(runtime.state)
+        self._observe_system_state()
+        self.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "board_disconnected",
+                "details": {"board_id": board_id},
+            }
+        )
 
         for board_seq, entry in list(self._pending.items()):
             if entry.board_id != board_id:
@@ -233,11 +265,21 @@ class ControllerCore:
             )
         runtime.state.queue_depth = 0
         runtime.state.in_flight_board_seq = None
+        self._observe_board_state(runtime.state)
 
     async def trigger_estop(self, *, origin_board: str | None = None) -> None:
         if self.state.system.estop_active:
             return
         self.state.system.latch_estop()
+        self._observe_system_state()
+        self.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "estop_triggered",
+                "details": {"origin_board": origin_board},
+            }
+        )
         for runtime in self._boards.values():
             while runtime.fifo:
                 entry = runtime.fifo.popleft()
@@ -247,6 +289,7 @@ class ControllerCore:
                     "queued command rejected: system is in e-stop",
                 )
             runtime.state.queue_depth = 0
+            self._observe_board_state(runtime.state)
 
         await asyncio.gather(
             *(
@@ -261,6 +304,7 @@ class ControllerCore:
         if runtime.writer is None:
             return
         runtime.state.mark_estop_sent()
+        self._observe_board_state(runtime.state)
         await send_estop(board_id, runtime.writer)
 
     def reset_estop(
@@ -292,6 +336,7 @@ class ControllerCore:
                 message="e-stop condition is still active",
             )
         self.state.system.operator_reset_estop()
+        self._observe_system_state()
         response = {
             "type": MessageType.RESPONSE.value,
             "seq": reset_message["seq"],
@@ -338,6 +383,7 @@ class ControllerCore:
         while runtime.fifo:
             entry = runtime.fifo.popleft()
             runtime.state.queue_depth = len(runtime.fifo)
+            self._observe_board_state(runtime.state)
             if entry.queue_residency_expired(loop.time()):
                 self.counters.stale_command_rejections += 1
                 self._resolve_entry_error(
@@ -356,6 +402,7 @@ class ControllerCore:
             runtime.state.in_flight_board_seq = entry.board_seq
             entry.written_at = loop.time()
             self._pending[entry.board_seq] = entry
+            self._observe_board_state(runtime.state)
             await runtime.writer.write_message(board_command)
             self._timeout_tasks[entry.board_seq] = asyncio.create_task(
                 self._execution_timeout(entry.board_seq, entry.execution_timeout_s)
@@ -371,6 +418,7 @@ class ControllerCore:
         runtime = self._boards[entry.board_id]
         if runtime.state.in_flight_board_seq == board_seq:
             runtime.state.in_flight_board_seq = None
+            self._observe_board_state(runtime.state)
         self._timeout_tasks.pop(board_seq, None)
         self._resolve_entry_error(
             entry,
@@ -403,16 +451,82 @@ class ControllerCore:
     ) -> None:
         if entry.future.done():
             return
-        entry.future.set_result(
-            build_error_response(
-                seq=entry.client_seq,
-                target=entry.client,
-                code=code,
-                message=message,
-            )
+        response = build_error_response(
+            seq=entry.client_seq,
+            target=entry.client,
+            code=code,
+            message=message,
         )
+        self._observe_command_lifecycle(
+            entry.command,
+            response,
+            board_id=entry.board_id,
+            board_seq=entry.board_seq,
+        )
+        entry.future.set_result(response)
 
     def _cancel_timeout(self, board_seq: int) -> None:
         task = self._timeout_tasks.pop(board_seq, None)
         if task is not None:
             task.cancel()
+
+    def observe_board_telemetry(self, message: dict[str, Any]) -> None:
+        if self.observability is None:
+            return
+        try:
+            self.observability.enqueue_board_telemetry(message)
+        except Exception:
+            return
+
+    def observe_board_state_snapshot(self, board_id: str) -> None:
+        self._observe_board_state(self._boards[board_id].state)
+
+    def observe_controller_event(self, event: dict[str, Any]) -> None:
+        if self.observability is None:
+            return
+        try:
+            self.observability.enqueue_controller_event(event)
+        except Exception:
+            return
+
+    def _observe_board_state(self, state: BoardState) -> None:
+        if self.observability is None:
+            return
+        try:
+            self.observability.enqueue_board_state(state)
+        except Exception:
+            return
+
+    def _observe_system_state(self) -> None:
+        if self.observability is None:
+            return
+        try:
+            self.observability.enqueue_system_state(self.state.system)
+        except Exception:
+            return
+
+    def _observe_command_lifecycle(
+        self,
+        command: dict[str, Any],
+        response: dict[str, Any],
+        *,
+        board_id: str,
+        board_seq: int | None = None,
+    ) -> None:
+        if self.observability is None:
+            return
+        error = response.get("error")
+        error_code = error.get("code") if isinstance(error, dict) else None
+        command_id = f"{board_id}:{board_seq}" if board_seq is not None else f"{board_id}:client:{command['seq']}"
+        try:
+            self.observability.enqueue_command_lifecycle(
+                command_id=command_id,
+                seq=command["seq"],
+                board_id=board_id,
+                status=response["status"],
+                board_seq=board_seq,
+                error_code=error_code,
+                command=command.get("command"),
+            )
+        except Exception:
+            return
