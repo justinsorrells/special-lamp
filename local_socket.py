@@ -8,6 +8,7 @@ firmware, or any direct board access.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 import asyncio
 import os
@@ -26,13 +27,20 @@ from protocol import (
 )
 
 
+@dataclass(frozen=True)
+class _OutboundMessage:
+    message: dict[str, Any]
+    critical: bool
+
+
 @dataclass(eq=False)
 class LocalClientConnection:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     outbound_maxsize: int
+    on_event_dropped: Callable[[], None] | None = None
     connected: bool = True
-    outbound: asyncio.Queue[dict[str, Any] | None] = field(init=False)
+    outbound: asyncio.Queue[_OutboundMessage | None] = field(init=False)
     writer_task: asyncio.Task[None] | None = None
 
     def __post_init__(self) -> None:
@@ -48,28 +56,41 @@ class LocalClientConnection:
     async def send_event(self, event: dict[str, Any], *, critical: bool = True) -> bool:
         return await self._send(event, critical=critical)
 
-    async def close(self) -> None:
+    async def close(self, *, flush: bool = True) -> None:
         self.connected = False
-        await self._put_sentinel()
-        if (
-            self.writer_task is not None
-            and self.writer_task is not asyncio.current_task()
-            and not self.writer_task.done()
-        ):
-            await self.writer_task
+        if flush:
+            await self._put_sentinel()
+            if (
+                self.writer_task is not None
+                and self.writer_task is not asyncio.current_task()
+                and not self.writer_task.done()
+            ):
+                await self.writer_task
         self.writer.close()
         try:
             await self.writer.wait_closed()
         except (ConnectionError, OSError):
             pass
+        if not flush:
+            await self._put_sentinel()
+            if (
+                self.writer_task is not None
+                and self.writer_task is not asyncio.current_task()
+                and not self.writer_task.done()
+            ):
+                self.writer_task.cancel()
+                try:
+                    await self.writer_task
+                except asyncio.CancelledError:
+                    pass
 
     async def writer_loop(self) -> None:
         while True:
-            message = await self.outbound.get()
-            if message is None:
+            item = await self.outbound.get()
+            if item is None:
                 return
             try:
-                self.writer.write(serialize_message(message, max_line_bytes=CONTROLLER_MAX_LINE_BYTES))
+                self.writer.write(serialize_message(item.message, max_line_bytes=CONTROLLER_MAX_LINE_BYTES))
                 await self.writer.drain()
             except (ConnectionError, OSError, ProtocolValidationError):
                 self.connected = False
@@ -78,14 +99,45 @@ class LocalClientConnection:
     async def _send(self, message: dict[str, Any], *, critical: bool) -> bool:
         if not self.is_connected:
             return False
+        item = _OutboundMessage(message=message, critical=critical)
         try:
-            self.outbound.put_nowait(message)
+            self.outbound.put_nowait(item)
             return True
         except asyncio.QueueFull:
             if not critical:
+                if self._evict_oldest_noncritical():
+                    self.outbound.put_nowait(item)
+                    return True
+                self._record_event_dropped()
                 return False
-            await self.close()
+            while self.outbound.full() and self._evict_oldest_noncritical():
+                pass
+            if not self.outbound.full():
+                self.outbound.put_nowait(item)
+                return True
+            await self.close(flush=False)
             return False
+
+    def _evict_oldest_noncritical(self) -> bool:
+        items: list[_OutboundMessage | None] = []
+        dropped = False
+        while True:
+            try:
+                items.append(self.outbound.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+
+        for item in items:
+            if not dropped and item is not None and not item.critical:
+                dropped = True
+                self._record_event_dropped()
+                continue
+            self.outbound.put_nowait(item)
+        return dropped
+
+    def _record_event_dropped(self) -> None:
+        if self.on_event_dropped is not None:
+            self.on_event_dropped()
 
     async def _put_sentinel(self) -> None:
         try:
@@ -105,12 +157,15 @@ class LocalUnixSocketServer:
         socket_path: str,
         controller: ControllerCore,
         outbound_queue_size: int = 1000,
+        estop_reset_condition_cleared: Callable[[], bool] | None = None,
     ):
         self.socket_path = socket_path
         self.controller = controller
         self.outbound_queue_size = outbound_queue_size
+        self.estop_reset_condition_cleared = estop_reset_condition_cleared or (lambda: True)
         self.server: asyncio.AbstractServer | None = None
         self.clients: set[LocalClientConnection] = set()
+        self.client_event_dropped = 0
 
     async def start(self) -> None:
         await self._prepare_socket_path()
@@ -157,6 +212,7 @@ class LocalUnixSocketServer:
             reader=reader,
             writer=writer,
             outbound_maxsize=self.outbound_queue_size,
+            on_event_dropped=self._increment_client_event_dropped,
         )
         self.clients.add(client)
         client.writer_task = asyncio.create_task(client.writer_loop())
@@ -182,6 +238,9 @@ class LocalUnixSocketServer:
                     continue
                 if message is None:
                     continue
+                if message["type"] == MessageType.ESTOP_RESET.value:
+                    asyncio.create_task(self._reset_estop_and_reply(client, message))
+                    continue
                 if message["type"] != MessageType.COMMAND.value:
                     await client.send_response(
                         build_error_response(
@@ -204,6 +263,20 @@ class LocalUnixSocketServer:
     ) -> None:
         response = await self.controller.route_command(command)
         await client.send_response(response)
+
+    async def _reset_estop_and_reply(
+        self,
+        client: LocalClientConnection,
+        reset_message: dict[str, Any],
+    ) -> None:
+        response = self.controller.reset_estop(
+            reset_message,
+            condition_cleared=self.estop_reset_condition_cleared(),
+        )
+        await client.send_response(response)
+
+    def _increment_client_event_dropped(self) -> None:
+        self.client_event_dropped += 1
 
     def _parse_client_line(
         self,

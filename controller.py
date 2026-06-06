@@ -15,6 +15,7 @@ from typing import Any
 from interfaces import BoardWriterHandle, send_estop
 from protocol import (
     ErrorCode,
+    MessageType,
     ProtocolValidationError,
     build_board_command,
     build_client_response,
@@ -262,6 +263,47 @@ class ControllerCore:
         runtime.state.mark_estop_sent()
         await send_estop(board_id, runtime.writer)
 
+    def reset_estop(
+        self,
+        reset_message: dict[str, Any],
+        *,
+        condition_cleared: bool = True,
+    ) -> dict[str, Any]:
+        validate_message(reset_message)
+        if reset_message["type"] != MessageType.ESTOP_RESET.value:
+            return build_error_response(
+                seq=self._message_seq(reset_message),
+                target=self._message_source(reset_message),
+                code=ErrorCode.INVALID_TYPE,
+                message="expected estop_reset message",
+            )
+        if reset_message["target"] != "controller":
+            return build_error_response(
+                seq=reset_message["seq"],
+                target=reset_message["source"],
+                code=ErrorCode.UNKNOWN_TARGET,
+                message=f"unknown controller target {reset_message['target']}",
+            )
+        if not condition_cleared:
+            return build_error_response(
+                seq=reset_message["seq"],
+                target=reset_message["source"],
+                code=ErrorCode.ESTOP_ACTIVE,
+                message="e-stop condition is still active",
+            )
+        self.state.system.operator_reset_estop()
+        response = {
+            "type": MessageType.RESPONSE.value,
+            "seq": reset_message["seq"],
+            "source": "controller",
+            "target": reset_message["source"],
+            "status": "ok",
+            "result": {"estop_active": False},
+            "error": None,
+        }
+        validate_message(response)
+        return response
+
     def pending_count(self, board_id: str | None = None) -> int:
         if board_id is None:
             return len(self._pending)
@@ -272,6 +314,18 @@ class ControllerCore:
 
     def in_flight_for(self, board_id: str) -> int | None:
         return self._boards[board_id].state.in_flight_board_seq
+
+    def _message_seq(self, message: dict[str, Any]) -> int:
+        seq = message.get("seq", 0)
+        if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+            return 0
+        return seq
+
+    def _message_source(self, message: dict[str, Any]) -> str:
+        source = message.get("source", "client")
+        if not isinstance(source, str):
+            return "client"
+        return source
 
     async def _dispatch_next(self, board_id: str) -> None:
         runtime = self._boards[board_id]

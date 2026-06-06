@@ -5,7 +5,7 @@ import tempfile
 import unittest
 
 from controller import ControllerCore
-from local_socket import LocalUnixSocketServer
+from local_socket import LocalClientConnection, LocalUnixSocketServer
 from protocol import ErrorCode, MessageType
 from state import BoardConnState
 from tests.test_controller_core import FakeBoardWriter, board_ok_response, client_command, schema_for
@@ -17,6 +17,53 @@ def encode(message):
 
 async def read_json(reader):
     return json.loads((await asyncio.wait_for(reader.readline(), timeout=0.5)).decode("utf-8"))
+
+
+def event_message(event_id):
+    return {
+        "type": "event",
+        "event_id": event_id,
+        "source": "controller",
+        "event": "board_state",
+        "details": {"event_id": event_id},
+    }
+
+
+def ok_response(seq):
+    return {
+        "type": "response",
+        "seq": seq,
+        "source": "controller",
+        "target": "gui",
+        "status": "ok",
+        "result": {},
+        "error": None,
+    }
+
+
+def queued_payloads(client):
+    return [item.message for item in list(client.outbound._queue) if item is not None]
+
+
+class FakeLocalWriter:
+    def __init__(self):
+        self.closed = False
+        self.writes = []
+
+    def is_closing(self):
+        return self.closed
+
+    def write(self, data):
+        self.writes.append(data)
+
+    async def drain(self):
+        pass
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        pass
 
 
 class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
@@ -191,6 +238,120 @@ class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(received["type"], MessageType.EVENT.value)
             self.assertEqual(received["event"], "board_disconnected")
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def test_noncritical_event_backpressure_drops_oldest_and_counts(self):
+        dropped = 0
+
+        def count_drop():
+            nonlocal dropped
+            dropped += 1
+
+        client = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=2,
+            on_event_dropped=count_drop,
+        )
+
+        self.assertTrue(await client.send_event(event_message(1), critical=False))
+        self.assertTrue(await client.send_event(event_message(2), critical=False))
+        self.assertTrue(await client.send_event(event_message(3), critical=False))
+
+        self.assertEqual(dropped, 1)
+        self.assertEqual([message["event_id"] for message in queued_payloads(client)], [2, 3])
+        self.assertTrue(client.is_connected)
+
+    async def test_critical_backpressure_evicts_noncritical_before_disconnect(self):
+        dropped = 0
+
+        def count_drop():
+            nonlocal dropped
+            dropped += 1
+
+        client = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=2,
+            on_event_dropped=count_drop,
+        )
+
+        self.assertTrue(await client.send_event(event_message(1), critical=False))
+        self.assertTrue(await client.send_response(ok_response(2)))
+        self.assertTrue(await client.send_response(ok_response(3)))
+
+        self.assertEqual(dropped, 1)
+        self.assertEqual([message["seq"] for message in queued_payloads(client)], [2, 3])
+        self.assertTrue(client.is_connected)
+
+    async def test_critical_backpressure_disconnects_when_only_critical_messages_are_queued(self):
+        client = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=1,
+        )
+
+        self.assertTrue(await client.send_response(ok_response(1)))
+        self.assertFalse(await client.send_response(ok_response(2)))
+
+        self.assertFalse(client.connected)
+        self.assertTrue(client.writer.closed)
+
+    async def test_estop_reset_routes_to_controller_instead_of_unknown_command(self):
+        self.controller.state.system.latch_estop()
+        reader, writer = await self.connect_client()
+        try:
+            writer.write(
+                encode(
+                    {
+                        "type": "estop_reset",
+                        "seq": 11,
+                        "source": "gui",
+                        "target": "controller",
+                    }
+                )
+            )
+            await writer.drain()
+
+            response = await read_json(reader)
+            self.assertEqual(response["status"], "ok")
+            self.assertEqual(response["seq"], 11)
+            self.assertEqual(response["target"], "gui")
+            self.assertEqual(response["result"]["estop_active"], False)
+            self.assertFalse(self.controller.state.system.estop_active)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def test_estop_reset_preserves_latch_when_condition_is_not_cleared(self):
+        await self.server.stop()
+        self.server = LocalUnixSocketServer(
+            socket_path=self.socket_path,
+            controller=self.controller,
+            estop_reset_condition_cleared=lambda: False,
+        )
+        await self.server.start()
+        self.controller.state.system.latch_estop()
+        reader, writer = await self.connect_client()
+        try:
+            writer.write(
+                encode(
+                    {
+                        "type": "estop_reset",
+                        "seq": 12,
+                        "source": "gui",
+                        "target": "controller",
+                    }
+                )
+            )
+            await writer.drain()
+
+            response = await read_json(reader)
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"]["code"], ErrorCode.ESTOP_ACTIVE.value)
+            self.assertTrue(self.controller.state.system.estop_active)
         finally:
             writer.close()
             await writer.wait_closed()
