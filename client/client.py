@@ -1,8 +1,13 @@
 import asyncio
+from collections import deque
 from enum import Enum
 import json
+import os
 import socket
+import struct
 import time
+
+SOCKET_PATH = "/tmp/chudmail"
 
 
 class Status(Enum):
@@ -35,6 +40,7 @@ class UDPClient:
         self.status = Status.DISCONNECTED
         self.threshold = 5.0
         self.timestamp = time.monotonic()
+        self.queue = deque()
 
     async def _connect(self):
         """
@@ -48,10 +54,10 @@ class UDPClient:
             "args": [],
         }
         await self._send(self._encode(packet))
-        try: 
+        try:
             data, addr = await self._receive()
         except asyncio.TimeoutError:
-            print(f'packet_no: {self.sequence_no} timed out')
+            print(f"packet_no: {self.sequence_no} timed out")
             self.dropped += 1
             return None
         data = self._decode(data)
@@ -83,10 +89,14 @@ class UDPClient:
         try:
             await loop.sock_sendto(self.socket, packet, self.addr)
         except Exception:
-            print(f'send to {self.addr} failed...')
+            print(f"send to {self.addr} failed...")
+
+    def enqueue_command(self, packet):
+        self.queue.append(packet)
 
     async def send_command(self, timeout=0.5):
-        if time.monotonic() - self.timestamp > self.threshold or self.schema == None:
+        self.set_command()
+        if time.monotonic() - self.timestamp > self.threshold or self.schema is None:
             self.status = Status.DISCONNECTED
         if self.status == Status.DISCONNECTED:
             await self._connect()
@@ -100,10 +110,10 @@ class UDPClient:
             "args": self.args,
         }
         await self._send(self._encode(packet))
-        try: 
+        try:
             data, addr = await self._receive(timeout)
         except asyncio.TimeoutError:
-            print(f'packet_no: {seq} timed out')
+            print(f"packet_no: {seq} timed out")
             self.dropped += 1
             return None
         data = self._decode(data)
@@ -113,38 +123,72 @@ class UDPClient:
             self.timestamp = data["timestamp"]
         return self.output
 
-    def set_command(self, cmd, args=None):
+    def set_command(self):
+        if len(self.queue) <= 0:
+            self.cmd = "info"
+            self.args = []
+            return
+        cmd, args = self.queue.popleft()
         self.cmd = cmd
         self.args = args
 
 
+def get_info(clients):
+    res = {}
+    for client in clients.values():
+        res[client.hostname] = client.schema
+    return res
+
+
+async def handle_command(reader, writer, clients):
+    try:
+        data = await reader.readline()
+        if not data:
+            return
+        message = json.loads(data.decode("utf-8"))
+        client_id = int(message["client"])
+        cmd = message["cmd"]
+        args = message.get("args", [])
+        if cmd == "boards":
+            response = get_info(clients)
+        elif client_id in clients:
+            clients[client_id].enqueue_command((cmd, args))
+            response = {"status": "accepted"}
+        else:
+            response = {"status": "rejected", "reason": "unknown client"}
+        writer.write((json.dumps(response) + "\n").encode("utf-8"))
+        await writer.drain()
+    except Exception as e:
+        response = {"status": "error", "reason": str(e)}
+        writer.write((json.dumps(response) + "\n").encode("utf-8"))
+        await writer.drain()
+    finally:
+        writer.close()
+        await writer.wait_closed()
+
+
 async def command_updater(clients, stop):
-    while not stop.is_set():
-        target = await asyncio.to_thread(input, "client id> ")
-        if target in {"exit", "quit", "q"}:
-            total = sum(client.sequence_no for client in clients.values())
-            dropped = sum(client.dropped for client in clients.values())
-            print(f'Total: {total}')
-            print(f'Dropped: {dropped}')
-            print(f'Percent recevied: {(total - dropped) / total}')
-            stop.set()
-            return 
-        cmd = await asyncio.to_thread(input, "cmd> ")
-        args = await asyncio.to_thread(input, "args> ")
-        try:
-            client_id = int(target)
-            client = clients[client_id]
-        except (ValueError, KeyError):
-            print("invalid client id")
-            continue
-        client.set_command(cmd, args.split())
+    if os.path.exists(SOCKET_PATH):
+        os.remove(SOCKET_PATH)
+
+    server = await asyncio.start_unix_server(
+        lambda reader, writer: handle_command(reader, writer, clients),
+        path=SOCKET_PATH,
+    )
+
+    async with server:
+        while not stop.is_set():
+            await asyncio.sleep(0.1)
+
+    server.close()
+    await server.wait_closed()
 
 
 async def flood(client, stop, hz=50):
     interval = 1.0 / hz
     while not stop.is_set():
         res = await client.send_command(timeout=0.02)
-        print(f'{client.hostname}: {res}')
+        print(f"{client.hostname}: {res}")
         await asyncio.sleep(interval)
 
 
@@ -152,18 +196,18 @@ async def main():
     start = time.monotonic()
     stop = asyncio.Event()
     clients = {
-        1: UDPClient(("192.168.10.188", 6767)),
-        2: UDPClient(("192.168.10.197", 6767)),
+        1: UDPClient(("127.0.0.1", 6767)),
     }
-    for idx,client in enumerate(clients.values()):
-        client.set_command("info", [])
-        client.hostname = idx+1
+    for idx, client in enumerate(clients.values()):
+        client.enqueue_command(("info", []))
+        client.hostname = idx + 1
 
     await asyncio.gather(
         *(flood(client, stop, hz=1) for client in clients.values()),
         command_updater(clients, stop),
     )
     print(time.monotonic() - start)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
