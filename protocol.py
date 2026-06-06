@@ -319,6 +319,8 @@ def build_error_response(
 ) -> dict[str, Any]:
     if status is TerminalStatus.OK:
         raise ProtocolValidationError(ErrorCode.INVALID_TYPE, "error responses cannot use ok status")
+    if status is TerminalStatus.TIMEOUT and code is not ErrorCode.COMMAND_TIMEOUT:
+        raise ProtocolValidationError(ErrorCode.INVALID_TYPE, "timeout status must carry COMMAND_TIMEOUT")
     if code is ErrorCode.COMMAND_TIMEOUT:
         status = TerminalStatus.TIMEOUT
     return {
@@ -379,8 +381,12 @@ def _validate_response(message: dict[str, Any]) -> None:
         raise ProtocolValidationError(ErrorCode.INVALID_TYPE, "ok response error must be null")
     if status is not TerminalStatus.OK:
         error = _required_object(message, "error")
-        require_error_code(_required_str(error, "code"))
+        code = require_error_code(_required_str(error, "code"))
         _required_str(error, "message")
+        if status is TerminalStatus.TIMEOUT and code is not ErrorCode.COMMAND_TIMEOUT:
+            raise ProtocolValidationError(ErrorCode.INVALID_TYPE, "timeout status must carry COMMAND_TIMEOUT")
+        if status is TerminalStatus.ERROR and code is ErrorCode.COMMAND_TIMEOUT:
+            raise ProtocolValidationError(ErrorCode.INVALID_TYPE, "COMMAND_TIMEOUT must use timeout status")
     if "result" in message and message["result"] is not None and not isinstance(message["result"], dict):
         raise ProtocolValidationError(ErrorCode.INVALID_TYPE, "result must be an object or null")
     if "controller_ts" in message and message["controller_ts"] is not None and not isinstance(message["controller_ts"], int | float):
