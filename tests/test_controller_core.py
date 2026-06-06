@@ -1,0 +1,376 @@
+import asyncio
+import unittest
+
+from controller import ControllerCore
+from protocol import BOARD_MAX_LINE_BYTES, ErrorCode, MessageType, ProtocolValidationError, parse_message
+from state import BoardConnState
+
+
+def schema_for(board_id="motor"):
+    return {
+        "type": "schema",
+        "seq": 1,
+        "source": board_id,
+        "target": "controller",
+        "protocol_version": "1",
+        "schema": {
+            "commands": {
+                "move": {"args": {"rpm": "int"}, "blocked_by_estop": True},
+                "status": {"args": {}, "blocked_by_estop": False},
+                "legacy_motion": {"args": {}},
+            },
+            "telemetry": {},
+            "state": {},
+        },
+    }
+
+
+def client_command(seq=1, target="motor", command="move", args=None):
+    return {
+        "type": "command",
+        "seq": seq,
+        "source": "gui",
+        "target": target,
+        "command": command,
+        "args": {} if args is None else args,
+    }
+
+
+def board_ok_response(board_seq, source="motor"):
+    return {
+        "type": "response",
+        "seq": board_seq,
+        "source": source,
+        "target": "controller",
+        "status": "ok",
+        "result": {"accepted": True},
+        "error": None,
+    }
+
+
+class FakeBoardWriter:
+    def __init__(self, *, delay=0.0):
+        self.lock = asyncio.Lock()
+        self.messages = []
+        self.started = asyncio.Event()
+        self.allow_finish = asyncio.Event()
+        self.delay = delay
+        self.use_gate = False
+
+    async def write_message(self, message):
+        async with self.lock:
+            self.started.set()
+            self.messages.append(message)
+            if self.use_gate:
+                await self.allow_finish.wait()
+            if self.delay:
+                await asyncio.sleep(self.delay)
+
+
+class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
+    def make_controller(self, *, boards=None):
+        if boards is None:
+            boards = {"motor"}
+        return ControllerCore(expected_boards=set(boards))
+
+    def register_motor(self, controller, writer=None):
+        if writer is None:
+            writer = FakeBoardWriter()
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+        return writer
+
+    async def wait_for_messages(self, writer, count):
+        for _ in range(100):
+            if len(writer.messages) >= count:
+                return
+            await asyncio.sleep(0)
+        self.fail(f"writer only received {len(writer.messages)} messages, expected {count}")
+
+    async def test_command_accepted_and_resolved_ok(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        task = asyncio.create_task(controller.route_command(client_command(seq=12)))
+        await self.wait_for_messages(writer, 1)
+        board_seq = writer.messages[0]["seq"]
+
+        await controller.handle_board_response(board_ok_response(board_seq))
+        response = await task
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["seq"], 12)
+        self.assertEqual(response["result"]["board_seq"], board_seq)
+        self.assertIsNone(controller.in_flight_for("motor"))
+        self.assertEqual(controller.pending_count("motor"), 0)
+
+    async def test_unknown_board_returns_unknown_target(self):
+        controller = self.make_controller()
+        response = await controller.route_command(client_command(target="missing"))
+
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error"]["code"], ErrorCode.UNKNOWN_TARGET.value)
+
+    async def test_board_unavailable_when_not_registered(self):
+        controller = self.make_controller()
+        response = await controller.route_command(client_command())
+
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error"]["code"], ErrorCode.BOARD_UNAVAILABLE.value)
+
+    async def test_board_unavailable_when_conn_state_not_registered(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+        controller.set_board_state("motor", BoardConnState.CONNECTED)
+
+        response = await controller.route_command(client_command())
+
+        self.assertEqual(response["error"]["code"], ErrorCode.BOARD_UNAVAILABLE.value)
+        self.assertEqual(writer.messages, [])
+
+    async def test_protocol_version_mismatch_faults_board_before_raising(self):
+        controller = self.make_controller()
+        writer = FakeBoardWriter()
+        bad_schema = schema_for("motor")
+        bad_schema["protocol_version"] = "2"
+
+        with self.assertRaises(ProtocolValidationError):
+            controller.register_board("motor", writer=writer, schema=bad_schema)
+
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.FAULTED)
+        self.assertEqual(writer.messages, [])
+
+    async def test_unknown_command_returns_unknown_command_error(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        response = await controller.route_command(client_command(command="missing"))
+
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error"]["code"], ErrorCode.UNKNOWN_COMMAND.value)
+        self.assertEqual(writer.messages, [])
+
+    async def test_execution_timeout_hard_ceiling_is_enforced(self):
+        controller = self.make_controller()
+        self.register_motor(controller)
+
+        with self.assertRaises(ValueError):
+            await controller.route_command(client_command(), execution_timeout_s=10.001)
+
+    async def test_board_busy_when_fifo_is_full(self):
+        controller = ControllerCore(expected_boards={"motor"}, fifo_depth=1)
+        writer = self.register_motor(controller)
+
+        first = asyncio.create_task(controller.route_command(client_command(seq=1)))
+        await self.wait_for_messages(writer, 1)
+        second = asyncio.create_task(controller.route_command(client_command(seq=2)))
+        await asyncio.sleep(0)
+        busy = await controller.route_command(client_command(seq=3))
+
+        self.assertEqual(busy["error"]["code"], ErrorCode.BOARD_BUSY.value)
+        self.assertEqual(controller.counters.board_busy_rejections, 1)
+        self.assertEqual(controller.fifo_depth_for("motor"), 1)
+
+        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+        await self.wait_for_messages(writer, 2)
+        await controller.handle_board_response(board_ok_response(writer.messages[1]["seq"]))
+
+        self.assertEqual((await first)["status"], "ok")
+        self.assertEqual((await second)["status"], "ok")
+
+    async def test_timeout_after_board_write(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        task = asyncio.create_task(
+            controller.route_command(client_command(seq=1), execution_timeout_s=0.01)
+        )
+        await self.wait_for_messages(writer, 1)
+        response = await asyncio.wait_for(task, timeout=0.2)
+
+        self.assertEqual(response["status"], "timeout")
+        self.assertEqual(response["error"]["code"], ErrorCode.COMMAND_TIMEOUT.value)
+        self.assertIsNone(controller.in_flight_for("motor"))
+        self.assertEqual(controller.pending_count(), 0)
+
+    async def test_queue_residency_timeout_cap(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        first = asyncio.create_task(controller.route_command(client_command(seq=1)))
+        await self.wait_for_messages(writer, 1)
+        second = asyncio.create_task(
+            controller.route_command(client_command(seq=2), queue_residency_cap_s=0.0)
+        )
+        await asyncio.sleep(0)
+
+        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+        second_response = await asyncio.wait_for(second, timeout=0.2)
+
+        self.assertEqual((await first)["status"], "ok")
+        self.assertEqual(second_response["status"], "timeout")
+        self.assertEqual(second_response["error"]["code"], ErrorCode.COMMAND_TIMEOUT.value)
+        self.assertEqual(controller.counters.stale_command_rejections, 1)
+        self.assertEqual(len(writer.messages), 1)
+
+    async def test_late_board_response_after_timeout_is_dropped_logged(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        task = asyncio.create_task(
+            controller.route_command(client_command(seq=1), execution_timeout_s=0.01)
+        )
+        await self.wait_for_messages(writer, 1)
+        board_seq = writer.messages[0]["seq"]
+        response = await asyncio.wait_for(task, timeout=0.2)
+        late = await controller.handle_board_response(board_ok_response(board_seq))
+
+        self.assertEqual(response["status"], "timeout")
+        self.assertIsNone(late)
+        self.assertEqual(controller.counters.unmatched_seq, 1)
+
+    async def test_duplicate_board_response_does_not_double_resolve(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        task = asyncio.create_task(controller.route_command(client_command(seq=1)))
+        await self.wait_for_messages(writer, 1)
+        board_seq = writer.messages[0]["seq"]
+        first = await controller.handle_board_response(board_ok_response(board_seq))
+        duplicate = await controller.handle_board_response(board_ok_response(board_seq))
+        response = await task
+
+        self.assertEqual(first["status"], "ok")
+        self.assertEqual(response["status"], "ok")
+        self.assertIsNone(duplicate)
+        self.assertEqual(controller.counters.unmatched_seq, 1)
+
+    async def test_board_down_resolves_in_flight_and_queued_commands(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        first = asyncio.create_task(controller.route_command(client_command(seq=1)))
+        await self.wait_for_messages(writer, 1)
+        second = asyncio.create_task(controller.route_command(client_command(seq=2)))
+        await asyncio.sleep(0)
+
+        await controller.board_down("motor")
+
+        first_response = await asyncio.wait_for(first, timeout=0.2)
+        second_response = await asyncio.wait_for(second, timeout=0.2)
+        self.assertEqual(first_response["error"]["code"], ErrorCode.BOARD_UNAVAILABLE.value)
+        self.assertEqual(second_response["error"]["code"], ErrorCode.BOARD_UNAVAILABLE.value)
+        self.assertEqual(controller.pending_count(), 0)
+        self.assertEqual(controller.fifo_depth_for("motor"), 0)
+        self.assertIsNone(controller.in_flight_for("motor"))
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.FAULTED)
+
+    async def test_estop_blocks_schema_blocked_commands_but_allows_unblocked(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+        controller.state.system.latch_estop()
+
+        blocked = await controller.route_command(client_command(seq=1, command="move"))
+        absent_defaults_blocked = await controller.route_command(
+            client_command(seq=2, command="legacy_motion")
+        )
+        allowed = asyncio.create_task(controller.route_command(client_command(seq=3, command="status")))
+        await self.wait_for_messages(writer, 1)
+        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+
+        self.assertEqual(blocked["error"]["code"], ErrorCode.ESTOP_ACTIVE.value)
+        self.assertEqual(absent_defaults_blocked["error"]["code"], ErrorCode.ESTOP_ACTIVE.value)
+        self.assertEqual((await allowed)["status"], "ok")
+        self.assertTrue(controller.state.system.estop_active)
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
+
+    async def test_estop_bypasses_fifo_but_uses_writer_lock(self):
+        controller = self.make_controller()
+        writer = FakeBoardWriter()
+        writer.use_gate = True
+        self.register_motor(controller, writer)
+
+        command_task = asyncio.create_task(controller.route_command(client_command(seq=1)))
+        await writer.started.wait()
+        await asyncio.sleep(0)
+
+        estop_task = asyncio.create_task(controller.send_estop_to_board("motor"))
+        await asyncio.sleep(0)
+        self.assertEqual(len(writer.messages), 1)
+        self.assertEqual(writer.messages[0]["type"], MessageType.COMMAND.value)
+
+        writer.allow_finish.set()
+        await asyncio.wait_for(estop_task, timeout=0.2)
+        self.assertEqual(len(writer.messages), 2)
+        self.assertEqual(writer.messages[1]["type"], MessageType.ESTOP.value)
+        self.assertEqual(controller.fifo_depth_for("motor"), 0)
+        self.assertEqual(controller.in_flight_for("motor"), writer.messages[0]["seq"])
+
+        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+        self.assertEqual((await command_task)["status"], "ok")
+
+    async def test_trigger_estop_clears_fifo_leaves_in_flight_and_sends_estop(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        first = asyncio.create_task(controller.route_command(client_command(seq=1)))
+        await self.wait_for_messages(writer, 1)
+        queued = asyncio.create_task(controller.route_command(client_command(seq=2)))
+        await asyncio.sleep(0)
+
+        await controller.trigger_estop(origin_board="motor")
+        queued_response = await asyncio.wait_for(queued, timeout=0.2)
+
+        self.assertEqual(queued_response["error"]["code"], ErrorCode.ESTOP_ACTIVE.value)
+        self.assertTrue(controller.state.system.estop_active)
+        self.assertEqual(writer.messages[1]["type"], MessageType.ESTOP.value)
+        self.assertIsNotNone(controller.in_flight_for("motor"))
+
+        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+        self.assertEqual((await first)["status"], "ok")
+
+    async def test_repeated_estop_trigger_is_noop(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        await controller.trigger_estop(origin_board="motor")
+        await controller.trigger_estop(origin_board="motor")
+
+        self.assertTrue(controller.state.system.estop_active)
+        self.assertEqual(len(writer.messages), 1)
+        self.assertEqual(writer.messages[0]["type"], MessageType.ESTOP.value)
+
+    async def test_connection_state_and_estop_state_remain_separate(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+        controller.state.system.latch_estop()
+        controller.set_board_state("motor", BoardConnState.DISCONNECTED)
+
+        self.assertTrue(controller.state.system.estop_active)
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.DISCONNECTED)
+        self.assertFalse(controller.state.boards["motor"].estop_ack)
+        self.assertEqual(writer.messages, [])
+
+
+class SerializedWriterSmokeTest(unittest.IsolatedAsyncioTestCase):
+    async def test_fake_transport_messages_remain_newline_json_compatible(self):
+        raw_writes = []
+
+        async def write_bytes(data):
+            raw_writes.append(data)
+
+        from interfaces import SerializedBoardWriter, send_estop
+
+        writer = SerializedBoardWriter(
+            board_id="motor",
+            write_bytes=write_bytes,
+            max_line_bytes=BOARD_MAX_LINE_BYTES,
+        )
+        await send_estop("motor", writer)
+
+        parsed = parse_message(raw_writes[0], max_line_bytes=BOARD_MAX_LINE_BYTES)
+        self.assertTrue(parsed.ok)
+        self.assertEqual(parsed.message["type"], MessageType.ESTOP.value)
+
+
+if __name__ == "__main__":
+    unittest.main()
