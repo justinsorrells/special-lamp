@@ -10,9 +10,9 @@ The **Agent Orchestrator** is a repo-local utility designed to automate the deve
 
 ## Desired Agent Workflow
 
-- **Antigravity (Gemini 3.5 Flash)**: Project manager, orchestrator, task sequencer, and final auditor.
+- **Antigravity (Gemini 3.5 Flash)**: Project manager, orchestrator, task sequencer, and final auditor. Invoked non-interactively via `agy --print` so its final response (including the `Final verdict:` line) is printed to stdout for parsing.
 - **Codex (GPT-5.5)**: Primary implementation agent that writes production code and tests.
-- **Claude CLI (Opus 4.8)**: Adversarial reviewer that verifies the git diff against the invariants.
+- **Claude CLI (Opus 4.8)**: Adversarial reviewer that verifies the git diff against the invariants. Invoked via `claude -p` (print mode).
 - **Human**: Exception handler, resolver of ambiguity, and final merge authority.
 
 No human gating is required for successful, passing tasks where all audits pass. If all checks, reviews, and audits pass, the orchestrator commits the changes to an agent branch. However, if Antigravity audit fails, the bounded override policy will route hard-stop and ambiguous cases to human review. The operator is also interrupted when a verification step fails or high-risk modifications are detected.

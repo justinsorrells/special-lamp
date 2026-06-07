@@ -15,6 +15,50 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
+# --- Verdict / marker parsing -------------------------------------------------
+# Anchored to line start and tolerant of Markdown emphasis (e.g. ``**Final
+# verdict:** PASS``), headings, blockquotes, and trailing punctuation, while
+# deliberately NOT matching diff-added/removed lines (no leading ``+``/``-``) so
+# verdict-looking text echoed inside a diff cannot spoof the result. The value
+# must be the whole line (modulo decoration/punctuation) — a line that continues
+# with prose (e.g. ``Final verdict: PASS, but actually FAIL``) fails to match and
+# is treated as "no verdict" (fail closed) rather than guessed. Callers take the
+# LAST match, so a planted earlier line always loses to the real final line.
+_VERDICT_LEAD = r"[ \t>*#_`]*"          # leading markdown/quote decoration (never +/-)
+_VERDICT_SEP = r"[ \t:*_`]*"            # separator between the label and its value
+_VERDICT_TRAIL = r"[ \t.*_`!?]*"        # trailing markdown/punctuation only (no prose)
+_FINAL_VERDICT_RE = re.compile(
+    rf"^{_VERDICT_LEAD}Final\s+verdict{_VERDICT_SEP}(PASS|FAIL){_VERDICT_TRAIL}$",
+    re.MULTILINE | re.IGNORECASE,
+)
+_ADJUDICATION_RE = re.compile(
+    rf"^{_VERDICT_LEAD}ANTIGRAVITY_ADJUDICATION{_VERDICT_SEP}(OVERRIDE_ALLOWED|HARD_STOP){_VERDICT_TRAIL}$",
+    re.MULTILINE | re.IGNORECASE,
+)
+_CONFIDENCE_RE = re.compile(
+    rf"^{_VERDICT_LEAD}confidence{_VERDICT_SEP}(low|medium|high){_VERDICT_TRAIL}$",
+    re.MULTILINE | re.IGNORECASE,
+)
+
+
+def last_anchored_match(pattern: "re.Pattern[str]", text: str) -> Optional[str]:
+    """Return the last anchored verdict/marker value in ``text``, or ``None``.
+
+    Anchored to line start and takes the last match so verdict-looking text
+    planted earlier in the output (e.g. echoed inside a diff) cannot override the
+    real final verdict.
+    """
+    matches = pattern.findall(text)
+    return matches[-1] if matches else None
+
+
+# agy --print defaults to a 5-minute wait; a real audit explores the repo and can
+# take longer (observed ~8 min), so we give it generous headroom to avoid
+# truncating a legitimate audit into an unparseable (verdict-less) response. A
+# proper config-driven subprocess timeout is tracked separately in the backlog.
+ANTIGRAVITY_PRINT_TIMEOUT = "20m"
+
+
 # Fallback TOML parser to maintain python 3.9 compatibility
 # Fallback TOML parser to maintain python 3.9 compatibility
 def parse_simple_toml(file_path: Path) -> dict:
@@ -890,14 +934,14 @@ class Orchestrator:
                 self.log_report(task_title, agent_branch, "STOP_CLAUDE_REVIEW_FAILED", f"Claude CLI execution failed: {cl_err}")
                 return "STOP_CLAUDE_REVIEW_FAILED"
 
-            # Parse Claude verdict (B4) safely (anchored multiline regex, taking the last match)
-            claude_verdict_matches = list(re.finditer(r"^Final verdict:\s*(PASS|FAIL)\s*$", cl_out, re.MULTILINE | re.IGNORECASE))
-            if not claude_verdict_matches:
+            # Parse Claude verdict safely (anchored, markdown-tolerant, last match)
+            claude_verdict = last_anchored_match(_FINAL_VERDICT_RE, cl_out)
+            if claude_verdict is None:
                 print("Claude review response was missing a valid final verdict.")
                 self.log_report(task_title, agent_branch, "STOP_CLAUDE_REVIEW_FAILED", "Could not parse PASS/FAIL verdict from Claude output.")
                 return "STOP_CLAUDE_REVIEW_FAILED"
-            
-            claude_verdict = claude_verdict_matches[-1].group(1).upper()
+
+            claude_verdict = claude_verdict.upper()
             print(f"Claude Review Verdict (cycle {cycle}): {claude_verdict}")
             
             # Check if there are items under "Must fix before commit:"
@@ -930,7 +974,18 @@ class Orchestrator:
             self.log_artifact(f"antigravity_prompt_cycle_{cycle}.md", antigravity_prompt)
 
             anti_cfg = self.config["agents"]["antigravity"]
-            anti_cmd = [anti_cfg["command"], "--model", anti_cfg["model"]]
+            # --print: run the prompt non-interactively and print the response to
+            # stdout (like ``claude -p``). Without it, agy runs agentically and
+            # writes its verdict to its own brain dir, leaving only narrative on
+            # stdout with no parseable ``Final verdict:`` line.
+            anti_cmd = [
+                anti_cfg["command"],
+                "--print",
+                "--print-timeout",
+                ANTIGRAVITY_PRINT_TIMEOUT,
+                "--model",
+                anti_cfg["model"],
+            ]
             
             ant_code, ant_out, ant_err = run_cmd(anti_cmd, input_str=antigravity_prompt)
             
@@ -944,14 +999,14 @@ class Orchestrator:
                 self.log_report(task_title, agent_branch, "STOP_ANTIGRAVITY_AUDIT_FAILED", f"Antigravity audit command failed: {ant_err}")
                 return "STOP_ANTIGRAVITY_AUDIT_FAILED"
 
-            # Parse Antigravity verdict safely (anchored multiline regex, taking the last match)
-            anti_verdict_matches = list(re.finditer(r"^Final verdict:\s*(PASS|FAIL)\s*$", ant_out, re.MULTILINE | re.IGNORECASE))
-            if not anti_verdict_matches:
+            # Parse Antigravity verdict safely (anchored, markdown-tolerant, last match)
+            anti_verdict = last_anchored_match(_FINAL_VERDICT_RE, ant_out)
+            if anti_verdict is None:
                 print("Antigravity audit response was missing a valid final verdict.")
                 self.log_report(task_title, agent_branch, "STOP_ANTIGRAVITY_AUDIT_FAILED", "Could not parse PASS/FAIL verdict from Antigravity audit.")
                 return "STOP_ANTIGRAVITY_AUDIT_FAILED"
-            
-            anti_verdict = anti_verdict_matches[-1].group(1).upper()
+
+            anti_verdict = anti_verdict.upper()
             print(f"Antigravity Audit Verdict: {anti_verdict}")
             
             if anti_verdict == "PASS":
@@ -1056,23 +1111,23 @@ class Orchestrator:
                     self.log_report(task_title, agent_branch, "STOP_CLAUDE_REVIEW_FAILED", f"Claude CLI adjudication failed: {cl_eval_err}")
                     return "STOP_CLAUDE_REVIEW_FAILED"
                 
-                # Parse adjudication verdict safely
-                adj_matches = list(re.finditer(r"^ANTIGRAVITY_ADJUDICATION:\s*(OVERRIDE_ALLOWED|HARD_STOP)\s*$", cl_eval_out, re.MULTILINE | re.IGNORECASE))
-                if not adj_matches:
+                # Parse adjudication verdict safely (anchored, markdown-tolerant, last match)
+                adjudication_verdict = last_anchored_match(_ADJUDICATION_RE, cl_eval_out)
+                if adjudication_verdict is None:
                     print("Claude adjudication response was missing a valid ANTIGRAVITY_ADJUDICATION line.")
                     self.log_report(task_title, agent_branch, "STOP_HUMAN_REVIEW_REQUIRED", "Claude adjudication output could not be parsed safely.")
                     return "STOP_HUMAN_REVIEW_REQUIRED"
-                
-                adjudication_verdict = adj_matches[-1].group(1).upper()
+
+                adjudication_verdict = adjudication_verdict.upper()
                 print(f"Claude Adjudication Verdict: {adjudication_verdict}")
-                
-                conf_matches = list(re.finditer(r"^confidence:\s*(low|medium|high)\s*$", cl_eval_out, re.MULTILINE | re.IGNORECASE))
-                if not conf_matches:
+
+                confidence = last_anchored_match(_CONFIDENCE_RE, cl_eval_out)
+                if confidence is None:
                     print("Claude adjudication response was missing a valid confidence level.")
                     self.log_report(task_title, agent_branch, "STOP_HUMAN_REVIEW_REQUIRED", "Claude confidence level is missing from adjudication.")
                     return "STOP_HUMAN_REVIEW_REQUIRED"
-                
-                confidence = conf_matches[-1].group(1).lower()
+
+                confidence = confidence.lower()
                 if confidence == "low":
                     print("Claude adjudication confidence is low. Stopping for human review.")
                     self.log_report(task_title, agent_branch, "STOP_HUMAN_REVIEW_REQUIRED", "Claude confidence level is low.")
