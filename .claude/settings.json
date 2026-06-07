@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=$(jq -r '.tool_input.file_path // .tool_response.filePath // empty'); case \"$f\" in *.py) if ! out=$(python tools/check_invariants.py 2>&1); then jq -n --arg r \"$out\" '{decision:\"block\",reason:(\"architecture invariant violation detected by tools/check_invariants.py:\\n\"+$r)}'; fi;; esac",
+            "statusMessage": "Checking architecture invariants"
+          }
+        ]
+      }
+    ]
+  }
+}
