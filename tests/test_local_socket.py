@@ -349,6 +349,22 @@ class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
+    async def test_command_during_shutdown_returns_controller_shutdown(self):
+        await self.controller.shutdown(drain_timeout_s=0.0)
+        reader, writer = await self.connect_client()
+        try:
+            writer.write(encode(client_command(seq=13)))
+            await writer.drain()
+
+            response = await read_json(reader)
+            self.assertEqual(response["status"], "error")
+            self.assertEqual(response["error"]["code"], ErrorCode.CONTROLLER_SHUTDOWN.value)
+            self.assertEqual(response["seq"], 13)
+            self.assertEqual(len(self.board_writer.messages), 0)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
     async def test_client_disconnect_before_response_does_not_crash_controller(self):
         reader, writer = await self.connect_client()
         try:

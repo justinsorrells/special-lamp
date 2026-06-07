@@ -195,6 +195,8 @@ class FakeBoardWriter:
         self.allow_finish = asyncio.Event()
         self.delay = delay
         self.use_gate = False
+        self.closed = False
+        self.close_count = 0
 
     async def write_message(self, message: dict[str, Any]) -> None:
         async with self.lock:
@@ -204,3 +206,7 @@ class FakeBoardWriter:
                 await self.allow_finish.wait()
             if self.delay:
                 await asyncio.sleep(self.delay)
+
+    async def close(self) -> None:
+        self.close_count += 1
+        self.closed = True

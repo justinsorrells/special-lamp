@@ -38,6 +38,9 @@ from state import (
     PendingCommand,
 )
 
+DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
+DEFAULT_SHUTDOWN_CLOSE_TIMEOUT_S = 0.2
+
 
 @dataclass
 class ControllerCounters:
@@ -132,6 +135,8 @@ class ControllerCore:
         self._timeout_tasks: dict[int, asyncio.Task[None]] = {}
         self._resolved_board_seqs: dict[int, str] = {}
         self._resolved_board_seq_order: deque[int] = deque(maxlen=4096)
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._shutting_down = False
 
     def register_board(
         self,
@@ -176,6 +181,16 @@ class ControllerCore:
         board_id = command["target"]
         client_seq = command["seq"]
         client_target = command["source"]
+        if self._shutting_down:
+            response = build_error_response(
+                seq=client_seq,
+                target=client_target,
+                code=ErrorCode.CONTROLLER_SHUTDOWN,
+                message="controller is shutting down",
+            )
+            self._record_terminal_response(response)
+            return response
+
         self._observe_command_lifecycle_phase(command, board_id=board_id, phase="received")
 
         runtime = self._boards.get(board_id)
@@ -376,6 +391,131 @@ class ControllerCore:
         runtime.state.queue_depth = 0
         runtime.state.in_flight_board_seq = None
         self._observe_board_state(runtime.state)
+
+    async def shutdown(
+        self,
+        *,
+        drain_timeout_s: float = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_S,
+        close_timeout_s: float = DEFAULT_SHUTDOWN_CLOSE_TIMEOUT_S,
+    ) -> None:
+        current_task = asyncio.current_task()
+        if self._shutdown_task is not None:
+            if self._shutdown_task is not current_task:
+                await self._shutdown_task
+            return
+
+        self._shutdown_task = asyncio.create_task(
+            self._run_shutdown(
+                drain_timeout_s=drain_timeout_s,
+                close_timeout_s=close_timeout_s,
+            )
+        )
+        await self._shutdown_task
+
+    async def _run_shutdown(
+        self,
+        *,
+        drain_timeout_s: float,
+        close_timeout_s: float,
+    ) -> None:
+        self._shutting_down = True
+        self.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "controller_shutdown_started",
+                "details": {"pending_count": len(self._pending)},
+            }
+        )
+        await self._drain_pending_commands(drain_timeout_s)
+        self._fail_remaining_for_shutdown()
+        await self._close_board_writers(close_timeout_s)
+        await self._stop_observability(close_timeout_s)
+        self.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "controller_shutdown_complete",
+                "details": {"pending_count": len(self._pending)},
+            }
+        )
+
+    async def _drain_pending_commands(self, drain_timeout_s: float) -> None:
+        if drain_timeout_s <= 0 or not self._pending:
+            return
+        pending_futures = [entry.future for entry in self._pending.values() if not entry.future.done()]
+        if not pending_futures:
+            return
+        await asyncio.wait(pending_futures, timeout=drain_timeout_s)
+
+    def _fail_remaining_for_shutdown(self) -> None:
+        for board_seq in list(self._pending):
+            popped = pop_pending(self._pending, board_seq)
+            if popped is None:
+                continue
+            self._cancel_timeout(board_seq)
+            self._resolve_entry_error(
+                popped,
+                ErrorCode.CONTROLLER_SHUTDOWN,
+                "controller shutdown before command resolved",
+                phase="controller_shutdown",
+            )
+
+        for runtime in self._boards.values():
+            while runtime.fifo:
+                entry = runtime.fifo.popleft()
+                self._resolve_entry_error(
+                    entry,
+                    ErrorCode.CONTROLLER_SHUTDOWN,
+                    "controller shutdown before command dispatched",
+                    phase="controller_shutdown",
+                )
+            runtime.state.queue_depth = 0
+            runtime.state.in_flight_board_seq = None
+            runtime.state.conn_state = BoardConnState.DISCONNECTED
+            self._observe_board_state(runtime.state)
+        self.state.refresh_connected_count()
+        self._observe_system_state()
+
+    async def _close_board_writers(self, close_timeout_s: float) -> None:
+        await asyncio.gather(
+            *(
+                self._close_board_writer(runtime.writer, close_timeout_s)
+                for runtime in self._boards.values()
+                if runtime.writer is not None
+            ),
+            return_exceptions=True,
+        )
+        for runtime in self._boards.values():
+            runtime.writer = None
+
+    async def _close_board_writer(
+        self,
+        writer: BoardWriterHandle,
+        close_timeout_s: float,
+    ) -> None:
+        try:
+            close = getattr(writer, "close", None)
+            if close is None:
+                return
+            result = close()
+            if result is None:
+                return
+            await asyncio.wait_for(result, timeout=close_timeout_s)
+        except Exception:
+            self.counters.increment("controller_shutdown_failures")
+
+    async def _stop_observability(self, close_timeout_s: float) -> None:
+        try:
+            stop = getattr(self.observability, "stop", None)
+            if stop is None:
+                return
+            result = stop()
+            if result is None:
+                return
+            await asyncio.wait_for(result, timeout=close_timeout_s)
+        except Exception:
+            self.counters.increment("controller_shutdown_failures")
 
     async def trigger_estop(self, *, origin_board: str | None = None) -> None:
         if self.state.system.estop_active:
@@ -593,6 +733,8 @@ class ControllerCore:
 
     async def _dispatch_next(self, board_id: str) -> None:
         runtime = self._boards[board_id]
+        if self._shutting_down:
+            return
         if runtime.writer is None or runtime.state.conn_state is not BoardConnState.REGISTERED:
             return
         if runtime.state.in_flight_board_seq is not None:
@@ -631,6 +773,14 @@ class ControllerCore:
                 controller_ts=entry.written_at,
             )
             await runtime.writer.write_message(board_command)
+            if entry.future.done():
+                self._pending.pop(entry.board_seq, None)
+                if runtime.state.in_flight_board_seq == entry.board_seq:
+                    runtime.state.in_flight_board_seq = None
+                    self._observe_board_state(runtime.state)
+                return
+            if self._shutting_down:
+                return
             self._timeout_tasks[entry.board_seq] = asyncio.create_task(
                 self._execution_timeout(entry.board_seq, entry.execution_timeout_s)
             )
