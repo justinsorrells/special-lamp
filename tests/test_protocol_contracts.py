@@ -14,6 +14,7 @@ from protocol import (
     build_board_command,
     build_client_response,
     build_error_response,
+    build_heartbeat_message,
     check_protocol_version,
     extract_blocked_by_estop,
     is_estop_ack_event,
@@ -371,6 +372,15 @@ class ProtocolContractTests(unittest.TestCase):
         }
         self.assertTrue(is_estop_ack_event(message))
 
+    def test_heartbeat_message_shape_is_not_a_command_response(self):
+        heartbeat = build_heartbeat_message(seq=5, source="controller", target="motor_controller")
+        parsed = parse_message(serialize_message(heartbeat, max_line_bytes=BOARD_MAX_LINE_BYTES))
+
+        self.assertTrue(parsed.ok)
+        self.assertEqual(parsed.message["type"], MessageType.HEARTBEAT.value)
+        self.assertNotIn("status", parsed.message)
+        self.assertNotIn("command", parsed.message)
+
     def test_pop_wins_first_consumer_gets_entry_late_duplicate_get_none(self):
         pending = {42: "entry"}
         self.assertEqual(pop_pending(pending, 42), "entry")
@@ -403,7 +413,9 @@ class StateContractTests(unittest.TestCase):
         record = BoardStateRecord.from_board_state(board).as_hash()
         self.assertEqual(record["conn_state"], "REGISTERED")
         self.assertIn("estop_ack", record)
+        self.assertIn("rx_path_suspect", record)
         self.assertFalse(record["estop_ack"])
+        self.assertFalse(record["rx_path_suspect"])
 
         system = SystemState()
         system.latch_estop()
@@ -471,6 +483,11 @@ class StateContractTests(unittest.TestCase):
             board_id="motor_controller",
             conn_state=BoardConnState.REGISTERED,
             estop_ack=True,
+            rx_path_suspect=True,
+            heartbeat_enabled=True,
+            heartbeat_missed_count=2,
+            last_heartbeat_sent_at=120.0,
+            last_heartbeat_ack_at=119.0,
             last_telemetry={"rpm": 100},
             last_seen=123.0,
             queue_depth=2,
@@ -482,6 +499,11 @@ class StateContractTests(unittest.TestCase):
 
         self.assertEqual(record.as_hash()["conn_state"], "REGISTERED")
         self.assertTrue(record.as_hash()["estop_ack"])
+        self.assertTrue(record.as_hash()["rx_path_suspect"])
+        self.assertTrue(record.as_hash()["heartbeat_enabled"])
+        self.assertEqual(record.as_hash()["heartbeat_missed_count"], 2)
+        self.assertEqual(record.as_hash()["last_heartbeat_sent_at"], 120.0)
+        self.assertEqual(record.as_hash()["last_heartbeat_ack_at"], 119.0)
         self.assertEqual(record.as_hash()["in_flight_board_seq"], 9)
 
         system = SystemState(estop_active=True, connected_count=1)

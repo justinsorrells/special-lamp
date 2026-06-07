@@ -24,8 +24,12 @@ pytest = true
 compileall = true
 ruff = "auto"
 mypy = "auto"
+invariants = true
 
 [limits]
 max_changed_files = 30
 max_diff_lines = 2500
 max_task_cycles = 5
+
+[review]
+allow_claude_override_antigravity = false

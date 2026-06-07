@@ -342,6 +342,21 @@ def build_estop_message(*, target: str, source: str = "controller") -> dict[str,
     }
 
 
+def build_heartbeat_message(
+    *,
+    seq: int,
+    target: str,
+    source: str = "controller",
+) -> dict[str, int | str]:
+    _validate_uint64(seq, "seq")
+    return {
+        "type": MessageType.HEARTBEAT.value,
+        "seq": seq,
+        "source": source,
+        "target": target,
+    }
+
+
 def is_estop_ack_event(message: dict[str, Any]) -> bool:
     validate_message(message)
     return (

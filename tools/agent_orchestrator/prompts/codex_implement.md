@@ -12,6 +12,9 @@ Please carefully review the following repository files for the authoritative rul
 - `.agents/skills/asyncio-controller/SKILL.md`
 - `.agents/skills/newline-json-protocol/SKILL.md`
 
+## Loaded Contracts and Context
+{CONTEXT_TEXT}
+
 ## Architecture Invariants
 
 Do not violate the following rules under any circumstances:
