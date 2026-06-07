@@ -9,7 +9,7 @@ mode = "print"
 model = "opus-4.8"
 
 [agents.antigravity]
-command = "antigravity"
+command = "agy"
 model = "gemini-3.5-flash"
 
 [repo]

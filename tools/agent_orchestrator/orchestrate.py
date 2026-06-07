@@ -86,7 +86,7 @@ def load_config(config_path: Optional[Path] = None) -> dict:
         "agents": {
             "codex": {"command": "codex", "mode": "exec", "model": "gpt-5.5"},
             "claude": {"command": "claude", "mode": "print", "model": "opus-4.8"},
-            "antigravity": {"command": "antigravity", "model": "gemini-3.5-flash"}
+            "antigravity": {"command": "agy", "model": "gemini-3.5-flash"}
         },
         "repo": {
             "main_branch": "main",
