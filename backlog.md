@@ -634,4 +634,25 @@ General rules for every task:
 
   Actively enforce the `never_auto_push` and `never_auto_merge` config flags in the orchestrator codebase. Currently, auto-push and auto-merge behavior is only prevented by omission (the orchestrator just does not implement them). They should be explicitly validated and strictly enforced in code.
 
+---
+
+* [ ] Task: Make Antigravity (`agy`) audit yield a parseable verdict and relax verdict parsing
+
+  ## Goal
+
+  The orchestrator cannot currently complete a real backlog run because the Antigravity audit step fails to produce a parseable verdict. On the first live end-to-end run (controller shutdown-draining task), Codex implemented the change, all checks passed, and Claude reviewed PASS, but the run stopped with `STOP_ANTIGRAVITY_AUDIT_FAILED` / "Could not parse PASS/FAIL verdict from Antigravity audit" even though `agy`'s own audit concluded the work passed.
+
+  Two distinct root causes, both in `tools/agent_orchestrator` (this is a high-trust, self-modifying orchestrator-maintenance task):
+
+  1. **`agy` does not emit a parseable verdict to stdout.** Unlike `claude -p` and `codex exec`, `agy` runs as a full agentic tool: it explores the repo and writes its real audit report (with the verdict) to its own brain directory (`~/.gemini/antigravity-cli/brain/<id>/audit_report.md`), streaming only a narrative to stdout that never contains a `Final verdict:` line. The audit prompt (`prompts/antigravity_audit.md`) and/or invocation must force `agy` to print exactly `Final verdict: PASS` or `Final verdict: FAIL` as the final stdout line (or the orchestrator must read agy's report artifact).
+
+  2. **The verdict parser is over-strict.** The anti-spoofing hardening locked parsing to `^Final verdict:\s*(PASS|FAIL)\s*$`, which rejects markdown emphasis (`**Final verdict:** PASS`), trailing punctuation, and headings — yet `README.md` still claims verdicts are "matched robustly regardless of Markdown emphasis." Relax the regex to tolerate leading/trailing markdown/whitespace while staying anchored to line start and taking the last match (preserving spoof-resistance), and reconcile the README claim.
+
+  ## Acceptance
+
+  * A real `agy` audit run yields a parseable PASS/FAIL verdict and can reach auto-commit.
+  * Verdict parser accepts `**Final verdict:** PASS`, `Final verdict: PASS.`, etc., while still ignoring verdict-looking text embedded mid-line / inside diffs, and still taking the last match.
+  * README verdict-robustness claim matches actual behavior.
+  * Add tests for the relaxed-but-anchored parsing and the agy-verdict extraction path.
+
 
