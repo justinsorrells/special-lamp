@@ -312,7 +312,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Implement metrics and lifecycle counters
+* [x] Task: Implement metrics and lifecycle counters
 
   ## Goal
 
