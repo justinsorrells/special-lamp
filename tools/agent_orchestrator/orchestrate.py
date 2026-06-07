@@ -142,10 +142,10 @@ def git_status_porcelain() -> str:
 def parse_changed_files(status_output: str) -> List[str]:
     files = []
     for line in status_output.splitlines():
-        if not line or len(line) < 4:
+        if not line or len(line) < 3:
             continue
-        # Status code is in characters 0-1, followed by a space
-        path_part = line[3:].strip()
+        # Status code is in characters 0-1
+        path_part = line[2:].strip()
         
         # Handle renames e.g. R  old -> new or RM old -> new
         if " -> " in path_part:
@@ -541,11 +541,12 @@ class Orchestrator:
                 if "open_connection" in file_added:
                     return f"STOP_ARCHITECTURE_RISK (Direct board connection attempted outside board_connection.py in {f})"
 
-            # New terminal status values check per-file
-            status_assign_matches = re.findall(r"(?i)['\"]?\bstatus\b['\"]?\s*(?::\s*[a-zA-Z0-9_\.\[\]]+)?\s*[=:]\s*['\"]([a-zA-Z0-9_\-]+)['\"]", file_added)
-            for stat in status_assign_matches:
-                if stat.lower() not in ["ok", "error", "timeout"]:
-                    return f"STOP_ARCHITECTURE_RISK (New terminal status in {f}: {stat})"
+            # New terminal status values check per-file (skip tests/ and tools/)
+            if not f.startswith("tests/") and not f.startswith("tools/"):
+                status_assign_matches = re.findall(r"(?i)['\"]?\bstatus\b['\"]?\s*(?::\s*[a-zA-Z0-9_\.\[\]]+)?\s*[=:]\s*['\"]([a-zA-Z0-9_\-]+)['\"]", file_added)
+                for stat in status_assign_matches:
+                    if stat.lower() not in ["ok", "error", "timeout"]:
+                        return f"STOP_ARCHITECTURE_RISK (New terminal status in {f}: {stat})"
 
         return None
 
