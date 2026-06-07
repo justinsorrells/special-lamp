@@ -85,7 +85,7 @@ def load_config(config_path: Optional[Path] = None) -> dict:
     return {
         "agents": {
             "codex": {"command": "codex", "mode": "exec", "model": "gpt-5.5"},
-            "claude": {"command": "claude", "mode": "print", "model": "opus-4.8"},
+            "claude": {"command": "claude", "mode": "print", "model": "opus"},
             "antigravity": {"command": "agy", "model": "gemini-3.5-flash"}
         },
         "repo": {
@@ -307,7 +307,7 @@ class Orchestrator:
         # 2. Claude
         claude_cfg = self.config.get("agents", {}).get("claude", {})
         claude_cmd = claude_cfg.get("command", "claude")
-        claude_model = claude_cfg.get("model", "opus-4.8")
+        claude_model = claude_cfg.get("model", "opus")
         
         print(f"Probing Claude CLI (cmd: {claude_cmd}, model: {claude_model})...")
         cl_code1, cl_out1, cl_err1 = run_cmd([claude_cmd, "--version"])

@@ -6,7 +6,7 @@ model = "gpt-5.5"
 [agents.claude]
 command = "claude"
 mode = "print"
-model = "opus-4.8"
+model = "opus"
 
 [agents.antigravity]
 command = "agy"

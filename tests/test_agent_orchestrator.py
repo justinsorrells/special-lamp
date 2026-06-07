@@ -18,7 +18,7 @@ class TestAgentOrchestrator(unittest.TestCase):
         self.config = {
             "agents": {
                 "codex": {"command": "codex", "mode": "exec", "model": "gpt-5.5"},
-                "claude": {"command": "claude", "mode": "print", "model": "opus-4.8"},
+                "claude": {"command": "claude", "mode": "print", "model": "opus"},
                 "antigravity": {"command": "antigravity", "model": "gemini-3.5-flash"}
             },
             "repo": {

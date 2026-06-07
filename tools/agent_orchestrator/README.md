@@ -40,10 +40,10 @@ model = "gpt-5.5"
 [agents.claude]
 command = "claude"
 mode = "print"
-model = "opus-4.8"
+model = "opus"
 
 [agents.antigravity]
-command = "antigravity"
+command = "agy"
 model = "gemini-3.5-flash"
 
 [repo]
