@@ -1,7 +1,8 @@
 import asyncio
 import unittest
+from collections import deque
 
-from board_connection import BoardEndpoint, BoardTCPConnection, HeartbeatConfig
+from board_connection import BoardEndpoint, BoardTCPConnection, HeartbeatConfig, ReconnectBackoff
 from controller import ControllerCore
 from observability import ObservabilityQueue
 from protocol import ErrorCode, MessageType, parse_message
@@ -389,7 +390,113 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["malformed_heartbeat_acks"], 1)
 
 
+class ReconnectBackoffTests(unittest.TestCase):
+    def test_full_jitter_uses_exponential_ceiling_and_caps(self):
+        fractions = deque([1.0, 0.5, 0.0, 1.0, 1.0])
+        backoff = ReconnectBackoff(
+            base_delay_s=0.5,
+            factor=2.0,
+            cap_delay_s=5.0,
+            random_fraction=fractions.popleft,
+        )
+
+        self.assertEqual(backoff.next_delay_s(), 0.5)
+        self.assertEqual(backoff.current_ceiling_s, 1.0)
+        self.assertEqual(backoff.next_delay_s(), 0.5)
+        self.assertEqual(backoff.current_ceiling_s, 2.0)
+        self.assertEqual(backoff.next_delay_s(), 0.0)
+        self.assertEqual(backoff.current_ceiling_s, 4.0)
+        self.assertEqual(backoff.next_delay_s(), 4.0)
+        self.assertEqual(backoff.current_ceiling_s, 5.0)
+        self.assertEqual(backoff.next_delay_s(), 5.0)
+        self.assertEqual(backoff.current_ceiling_s, 5.0)
+
+    def test_reset_returns_ceiling_to_base(self):
+        backoff = ReconnectBackoff(
+            base_delay_s=0.5,
+            factor=2.0,
+            cap_delay_s=5.0,
+            random_fraction=lambda: 1.0,
+        )
+        backoff.next_delay_s()
+        backoff.next_delay_s()
+
+        backoff.reset()
+
+        self.assertEqual(backoff.current_ceiling_s, 0.5)
+        self.assertEqual(backoff.next_delay_s(), 0.5)
+
+    def test_validation_rejects_invalid_backoff_settings(self):
+        with self.assertRaises(ValueError):
+            ReconnectBackoff(base_delay_s=0.0)
+        with self.assertRaises(ValueError):
+            ReconnectBackoff(factor=1.0)
+        with self.assertRaises(ValueError):
+            ReconnectBackoff(base_delay_s=1.0, cap_delay_s=0.5)
+
+        backoff = ReconnectBackoff(random_fraction=lambda: 1.01)
+        with self.assertRaises(ValueError):
+            backoff.next_delay_s()
+
+
 class BoardConnectionUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_reconnect_wait_is_interrupted_by_stop_event(self):
+        controller = ControllerCore(expected_boards={"motor"})
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", 1),
+            controller,
+            reconnect_backoff=ReconnectBackoff(
+                base_delay_s=10.0,
+                cap_delay_s=10.0,
+                random_fraction=lambda: 1.0,
+            ),
+        )
+
+        wait_task = asyncio.create_task(connection._wait_before_reconnect())
+        connection._stop.set()
+        await asyncio.wait_for(wait_task, timeout=0.1)
+
+    async def test_successful_registration_resets_reconnect_backoff(self):
+        server = FakeBoardTCPServer()
+        try:
+            await server.start()
+        except PermissionError as exc:
+            raise unittest.SkipTest(f"TCP bind unavailable in this environment: {exc}") from exc
+        controller = ControllerCore(expected_boards={"motor"})
+        backoff = ReconnectBackoff(
+            base_delay_s=0.02,
+            factor=2.0,
+            cap_delay_s=1.0,
+            random_fraction=lambda: 1.0,
+        )
+        backoff.next_delay_s()
+        backoff.next_delay_s()
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", server.port),
+            controller,
+            reconnect_backoff=backoff,
+        )
+        try:
+            connection.start()
+            await connection.wait_registered()
+
+            self.assertEqual(backoff.current_ceiling_s, 0.02)
+            self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
+        finally:
+            await connection.stop()
+            await server.close()
+
+    async def test_constructor_rejects_two_reconnect_delay_sources(self):
+        controller = ControllerCore(expected_boards={"motor"})
+
+        with self.assertRaises(ValueError):
+            BoardTCPConnection(
+                BoardEndpoint("motor", "127.0.0.1", 1),
+                controller,
+                reconnect_delay_s=0.1,
+                reconnect_backoff=ReconnectBackoff(),
+            )
+
     async def test_malformed_board_message_counter_increments_without_tcp_socket(self):
         controller = ControllerCore(expected_boards={"motor"})
         connection = BoardTCPConnection(
