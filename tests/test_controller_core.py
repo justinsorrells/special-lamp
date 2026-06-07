@@ -75,12 +75,33 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
             "commands_completed_error",
             "commands_completed_timeout",
             "stale_command_rejections",
+            "heartbeat_acks_missed",
+            "malformed_heartbeat_acks",
+            "late_heartbeat_acks",
         }
 
         self.assertEqual(set(snapshot), expected_counters)
         self.assertTrue(all(value == 0 for value in snapshot.values()))
         snapshot["unmatched_seq"] = 99
         self.assertEqual(controller.metrics_snapshot()["unmatched_seq"], 0)
+
+    async def test_heartbeat_state_is_observability_only_and_separate_from_connection_axis(self):
+        controller = self.make_controller()
+        self.register_motor(controller)
+
+        controller.record_heartbeat_sent("motor", seq=1, sent_at=10.0)
+        controller.record_heartbeat_missed("motor", seq=1, suspect_after_misses=1)
+        board = controller.state.boards["motor"]
+
+        self.assertEqual(board.conn_state, BoardConnState.REGISTERED)
+        self.assertTrue(board.heartbeat_enabled)
+        self.assertTrue(board.rx_path_suspect)
+        self.assertEqual(controller.metrics_snapshot()["heartbeat_acks_missed"], 1)
+
+        controller.record_heartbeat_ack("motor", seq=2, ack_at=11.0)
+        self.assertEqual(board.conn_state, BoardConnState.REGISTERED)
+        self.assertFalse(board.rx_path_suspect)
+        self.assertEqual(board.heartbeat_missed_count, 0)
 
     async def test_command_send_records_monotonic_controller_timestamp(self):
         clock = FakeClock(500.25)

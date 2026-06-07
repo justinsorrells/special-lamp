@@ -19,6 +19,7 @@ from protocol import (
     CONTROLLER_MAX_LINE_BYTES,
     MessageType,
     ProtocolValidationError,
+    build_heartbeat_message,
     is_estop_ack_event,
     parse_message,
     serialize_message,
@@ -31,6 +32,22 @@ class BoardEndpoint:
     board_id: str
     host: str
     port: int
+
+
+@dataclass(frozen=True)
+class HeartbeatConfig:
+    enabled: bool = False
+    interval_s: float = 5.0
+    ack_timeout_s: float = 1.0
+    suspect_after_misses: int = 3
+
+    def __post_init__(self) -> None:
+        if self.interval_s <= 0:
+            raise ValueError("heartbeat interval must be positive")
+        if self.ack_timeout_s <= 0:
+            raise ValueError("heartbeat ack timeout must be positive")
+        if self.suspect_after_misses <= 0:
+            raise ValueError("heartbeat suspect threshold must be positive")
 
 
 class StreamBoardWriter(BoardWriterHandle):
@@ -66,14 +83,20 @@ class BoardTCPConnection:
         *,
         reconnect_delay_s: float = 0.05,
         registration_timeout_s: float = 2.0,
+        heartbeat: HeartbeatConfig | None = None,
     ):
         self.endpoint = endpoint
         self.controller = controller
         self.reconnect_delay_s = reconnect_delay_s
         self.registration_timeout_s = registration_timeout_s
+        self.heartbeat = HeartbeatConfig() if heartbeat is None else heartbeat
         self._stop = asyncio.Event()
         self._registered = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
+        self._heartbeat_task: asyncio.Task[None] | None = None
+        self._heartbeat_ack = asyncio.Event()
+        self._heartbeat_seq = 0
+        self._pending_heartbeat_seq: int | None = None
         self._stream_writer: StreamBoardWriter | None = None
 
     def start(self) -> None:
@@ -83,6 +106,7 @@ class BoardTCPConnection:
 
     async def stop(self) -> None:
         self._stop.set()
+        await self._stop_heartbeat()
         if self._stream_writer is not None:
             await self._stream_writer.close()
         if self._task is not None:
@@ -134,12 +158,14 @@ class BoardTCPConnection:
             self._registered.set()
             if self.controller.state.system.estop_active:
                 await self.controller.send_estop_to_board(self.endpoint.board_id)
+            self._start_heartbeat(stream_writer)
 
             await self._read_loop(reader)
         except (TimeoutError, ConnectionError, OSError):
             # Future metrics hook: distinguish registration_timeouts from connect/read failures.
             self.controller.set_board_state(self.endpoint.board_id, BoardConnState.FAULTED)
         finally:
+            await self._stop_heartbeat()
             self._registered.clear()
             self._stream_writer = None
             if raw_writer is not None:
@@ -196,6 +222,8 @@ class BoardTCPConnection:
         elif message_type == MessageType.SCHEMA.value:
             # A reconnect schema is handled by establishing a fresh connection.
             return
+        elif message_type == MessageType.HEARTBEAT.value:
+            self._handle_heartbeat_ack(message)
 
     async def _handle_event(self, message: dict[str, Any]) -> None:
         board = self.controller.state.boards[self.endpoint.board_id]
@@ -204,3 +232,83 @@ class BoardTCPConnection:
             self.controller.observe_board_state_snapshot(self.endpoint.board_id)
         elif message.get("event") == "estop_triggered":
             await self.controller.trigger_estop(origin_board=message.get("source"))
+
+    def _start_heartbeat(self, writer: StreamBoardWriter) -> None:
+        if not self.heartbeat.enabled:
+            self.controller.mark_heartbeat_disabled(self.endpoint.board_id)
+            return
+        if self._heartbeat_task is not None:
+            return
+        self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(writer))
+
+    async def _stop_heartbeat(self) -> None:
+        task = self._heartbeat_task
+        self._heartbeat_task = None
+        self._pending_heartbeat_seq = None
+        self._heartbeat_ack.set()
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _heartbeat_loop(self, writer: StreamBoardWriter) -> None:
+        try:
+            while not self._stop.is_set():
+                await asyncio.sleep(self.heartbeat.interval_s)
+                if self._stop.is_set():
+                    return
+                await self._send_one_heartbeat(writer)
+        except asyncio.CancelledError:
+            raise
+        except (ConnectionError, OSError, ProtocolValidationError):
+            return
+
+    async def _send_one_heartbeat(self, writer: StreamBoardWriter) -> None:
+        self._heartbeat_seq += 1
+        seq = self._heartbeat_seq
+        self._pending_heartbeat_seq = seq
+        self._heartbeat_ack.clear()
+        sent_at = asyncio.get_running_loop().time()
+        await writer.write_message(
+            build_heartbeat_message(
+                seq=seq,
+                target=self.endpoint.board_id,
+            )
+        )
+        self.controller.record_heartbeat_sent(self.endpoint.board_id, seq=seq, sent_at=sent_at)
+        try:
+            await asyncio.wait_for(self._heartbeat_ack.wait(), timeout=self.heartbeat.ack_timeout_s)
+        except TimeoutError:
+            if self._pending_heartbeat_seq == seq:
+                self._pending_heartbeat_seq = None
+                self.controller.record_heartbeat_missed(
+                    self.endpoint.board_id,
+                    seq=seq,
+                    suspect_after_misses=self.heartbeat.suspect_after_misses,
+                )
+
+    def _handle_heartbeat_ack(self, message: dict[str, Any]) -> None:
+        seq = message.get("seq")
+        if (
+            not isinstance(seq, int)
+            or isinstance(seq, bool)
+            or message.get("source") != self.endpoint.board_id
+            or message.get("target") != "controller"
+        ):
+            self.controller.record_malformed_heartbeat_ack(self.endpoint.board_id, seq=seq)
+            return
+
+        if seq != self._pending_heartbeat_seq:
+            self.controller.record_late_heartbeat_ack(self.endpoint.board_id, seq=seq)
+            return
+
+        self._pending_heartbeat_seq = None
+        self.controller.record_heartbeat_ack(
+            self.endpoint.board_id,
+            seq=seq,
+            ack_at=asyncio.get_running_loop().time(),
+        )
+        self._heartbeat_ack.set()

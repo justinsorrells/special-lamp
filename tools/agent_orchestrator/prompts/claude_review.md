@@ -12,6 +12,9 @@ The project constraints and rules are defined in:
 - `.agents/skills/asyncio-controller/SKILL.md`
 - `.agents/skills/newline-json-protocol/SKILL.md`
 
+## Loaded Contracts and Context
+{CONTEXT_TEXT}
+
 ## Review Rules
 
 You must review the diff below against these invariants.

@@ -423,7 +423,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Implement optional heartbeat and RX-path insurance
+* [x] Task: Implement optional heartbeat and RX-path insurance
 
   ## Goal
 

@@ -2,6 +2,7 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from tools.agent_orchestrator.orchestrate import (
     Orchestrator,
@@ -230,6 +231,187 @@ diff --git a/controller.py b/controller.py
         res = self.orchestrator.check_forbidden_patterns(diff, ["controller.py"], "test task")
         self.assertIsNotNone(res)
         self.assertIn("STOP_ARCHITECTURE_RISK", res)
+
+    def test_config_example_toml_parsing(self):
+        # Verify simple toml parser can read config.example.toml
+        path = Path("tools/agent_orchestrator/config.example.toml")
+        parsed = parse_simple_toml(path)
+        self.assertIn("agents", parsed)
+        self.assertIn("checks", parsed)
+        self.assertIn("review", parsed)
+        self.assertEqual(parsed["checks"]["invariants"], True)
+        self.assertEqual(parsed["review"]["allow_claude_override_antigravity"], False)
+
+    def test_dry_run_and_prompt_rendering(self):
+        # Set agent_runs_parent to temp_dir
+        self.orchestrator.agent_runs_parent = Path(self.temp_dir)
+        
+        # Create a temp task file
+        task_file = Path(self.temp_dir) / "dummy_task.md"
+        task_file.write_text("# Dummy Task\n\nImplement something cool.", encoding="utf-8")
+        
+        # Mock verify_models to return True
+        self.orchestrator.verify_models = lambda: (True, "All models verified")
+        
+        # Run execution
+        res = self.orchestrator.execute_task(task_file)
+        
+        # 1. Assert dry run returns DRY_RUN_OK
+        self.assertEqual(res, "DRY_RUN_OK")
+        
+        # 2. Assert codex_prompt.md artifact contains prompt context
+        prompt_artifact = next(Path(self.temp_dir).rglob("codex_prompt.md"), None)
+        self.assertIsNotNone(prompt_artifact)
+        
+        prompt_content = prompt_artifact.read_text(encoding="utf-8")
+        self.assertIn("Dummy Task", prompt_content)
+        self.assertIn("Loaded Contracts and Context", prompt_content)
+        self.assertIn("Hyperloop board networking stack", prompt_content)
+
+    @patch("tools.agent_orchestrator.orchestrate.run_cmd")
+    def test_invariant_check_failure_stops_before_claude(self, mock_run_cmd):
+        def side_effect(args, *arg, **kw):
+            cmd = args[0]
+            if cmd == "codex":
+                return 0, "Codex finished successfully", ""
+            elif cmd == "git":
+                sub = args[1]
+                if sub == "status":
+                    return 0, " M file.py\n", ""
+                elif sub == "diff":
+                    return 0, "some diff", ""
+                elif sub == "rev-parse":
+                    return 0, "commit_hash", ""
+                elif sub == "checkout":
+                    return 0, "", ""
+                elif sub == "branch":
+                    return 0, "agent/branch", ""
+                elif sub == "add":
+                    return 0, "", ""
+            elif any("compileall" in a for a in args):
+                return 0, "compile ok", ""
+            elif any("pytest" in a for a in args):
+                return 0, "pytest ok", ""
+            elif any("ruff" in a for a in args):
+                return 0, "ruff ok", ""
+            elif any("mypy" in a for a in args):
+                return 0, "mypy ok", ""
+            elif any("check_invariants.py" in a for a in args):
+                return 1, "Failed: invariants violated", ""
+            elif cmd == "claude":
+                if "--version" in args or "--help" in args:
+                    return 0, "probe ok", ""
+                return 0, "Final verdict: PASS\nMust fix before commit: None", ""
+            elif cmd in ("agy", "antigravity"):
+                return 0, "probe ok", ""
+            return 0, "", ""
+            
+        mock_run_cmd.side_effect = side_effect
+        
+        self.orchestrator.dry_run = False
+        self.orchestrator.allow_dirty = True
+        self.orchestrator.agent_runs_parent = Path(self.temp_dir)
+        
+        self.orchestrator.config["checks"]["invariants"] = True
+        self.orchestrator.config["limits"]["max_task_cycles"] = 1
+        
+        task_file = Path(self.temp_dir) / "dummy_task.md"
+        task_file.write_text("# Dummy Task\n\nImplement something cool.", encoding="utf-8")
+        
+        res = self.orchestrator.execute_task(task_file)
+        self.assertEqual(res, "STOP_INVARIANTS_FAILED")
+        
+        invariants_log_file = next(Path(self.temp_dir).rglob("check_invariants.txt"), None)
+        self.assertIsNotNone(invariants_log_file)
+        self.assertIn("Failed: invariants violated", invariants_log_file.read_text())
+        
+        claude_review_file = next(Path(self.temp_dir).rglob("claude_review.md"), None)
+        self.assertIsNone(claude_review_file)
+
+    @patch("tools.agent_orchestrator.orchestrate.run_cmd")
+    def test_antigravity_fail_stops_for_human_review(self, mock_run_cmd):
+        def side_effect(args, *arg, **kw):
+            cmd = args[0]
+            if cmd == "codex":
+                return 0, "Codex finished successfully", ""
+            elif cmd == "git":
+                sub = args[1]
+                if sub == "status":
+                    return 0, " M file.py\n", ""
+                elif sub == "diff":
+                    return 0, "some diff", ""
+            elif any(
+                k in a
+                for k in ("compileall", "pytest", "ruff", "mypy", "check_invariants.py")
+                for a in args
+            ):
+                return 0, "check passed", ""
+            elif cmd == "claude":
+                if "--version" in args or "--help" in args:
+                    return 0, "version ok", ""
+                return 0, "Final verdict: PASS\nMust fix before commit: None", ""
+            elif cmd in ("agy", "antigravity"):
+                if "--version" in args or "--help" in args:
+                    return 0, "version ok", ""
+                return 0, "Final verdict: FAIL\nReasoning: Some issues found.", ""
+            return 0, "", ""
+            
+        mock_run_cmd.side_effect = side_effect
+        
+        self.orchestrator.dry_run = False
+        self.orchestrator.allow_dirty = True
+        self.orchestrator.agent_runs_parent = Path(self.temp_dir)
+        self.orchestrator.config["limits"]["max_task_cycles"] = 1
+        self.orchestrator.config["review"] = {"allow_claude_override_antigravity": False}
+        
+        task_file = Path(self.temp_dir) / "dummy_task.md"
+        task_file.write_text("# Dummy Task\n\nImplement something cool.", encoding="utf-8")
+        
+        res = self.orchestrator.execute_task(task_file)
+        self.assertEqual(res, "STOP_ANTIGRAVITY_AUDIT_FAILED")
+
+    def test_backlog_extraction_with_nested_bullets(self):
+        backlog_content = """# Backlog
+* [ ] Task: Task with details
+  ## Goal
+  Do some cool stuff.
+  - bullet 1
+  - bullet 2
+* [ ] Task: Next Task
+"""
+        backlog_file = Path(self.temp_dir) / "backlog.md"
+        backlog_file.write_text(backlog_content, encoding="utf-8")
+        
+        import re
+        task_pattern = re.compile(r"^\s*[-\*]\s*\[\s*\]\s+(.*)$", re.MULTILINE)
+        matches = list(task_pattern.finditer(backlog_content))
+        
+        self.assertEqual(len(matches), 2)
+        match = matches[0]
+        task_line_text = match.group(1).strip()
+        self.assertEqual(task_line_text, "Task: Task with details")
+        
+        task_start = match.start()
+        remaining_text = backlog_content[task_start:]
+        lines = remaining_text.splitlines()
+        
+        task_lines = [lines[0]]
+        for line in lines[1:]:
+            is_checkbox = re.match(r"^\s*[-\*]\s*\[\s*[xX ]\s*\]", line)
+            is_top_level_heading = re.match(r"^#\s+", line)
+            is_hr = re.match(r"^---", line)
+            if is_checkbox or is_top_level_heading or is_hr:
+                break
+            task_lines.append(line)
+            
+        task_lines[0] = f"# {task_line_text}"
+        full_scratch_content = "\n".join(task_lines)
+        
+        self.assertIn("# Task: Task with details", full_scratch_content)
+        self.assertIn("## Goal", full_scratch_content)
+        self.assertIn("- bullet 1", full_scratch_content)
+        self.assertIn("- bullet 2", full_scratch_content)
+        self.assertNotIn("Next Task", full_scratch_content)
 
 if __name__ == "__main__":
     unittest.main()
