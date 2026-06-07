@@ -127,7 +127,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Implement local client event backpressure
+* [x] Task: Implement local client event backpressure
 
   ## Goal
 
