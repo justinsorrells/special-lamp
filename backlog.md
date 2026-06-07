@@ -698,7 +698,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Implement telemetry-loss liveness FAULT watchdog (contract 1.6)
+* [x] Task: Implement telemetry-loss liveness FAULT watchdog (contract 1.6)
 
   ## Goal
 
