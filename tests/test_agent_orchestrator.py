@@ -1,16 +1,18 @@
+import shutil
+import tempfile
 import unittest
 from pathlib import Path
-import tempfile
-import shutil
+
 from tools.agent_orchestrator.orchestrate import (
+    Orchestrator,
+    extract_added_lines,
+    parse_changed_files,
+    parse_must_fix,
+    parse_per_file_diff,
     parse_simple_toml,
     slugify,
-    Orchestrator,
-    parse_changed_files,
-    extract_added_lines,
-    parse_must_fix,
-    parse_per_file_diff
 )
+
 
 class TestAgentOrchestrator(unittest.TestCase):
     def setUp(self):
@@ -90,7 +92,9 @@ max_limit = 100
         self.assertEqual(res, "STOP_CONTRACT_CHANGE")
         
         # Should allow if task explicitly contains permission keyword
-        res_allowed = self.orchestrator.check_forbidden_patterns(diff, changed_files, "allow editing contracts for this task")
+        res_allowed = self.orchestrator.check_forbidden_patterns(
+            diff, changed_files, "allow editing contracts for this task"
+        )
         self.assertNotEqual(res_allowed, "STOP_CONTRACT_CHANGE")
 
     def test_forbidden_patterns_skills_file(self):

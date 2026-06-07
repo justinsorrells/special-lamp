@@ -7,15 +7,14 @@ snapshots, controller events, and command lifecycle records.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import asyncio
 import json
 import logging
 import time
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from state import BoardState, BoardStateRecord, SystemState, SystemStateRecord
-
 
 DEFAULT_OBS_QUEUE_SIZE = 20_000
 DEFAULT_STREAM_MAXLEN = 100_000
@@ -159,7 +158,7 @@ class RedisTelemetryWorker:
             return
         try:
             await asyncio.wait_for(self.obs_queue.queue.join(), timeout=drain_timeout_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             pass
         self._task.cancel()
         try:
@@ -171,7 +170,7 @@ class RedisTelemetryWorker:
         while not self._stop.is_set() or not self.obs_queue.queue.empty():
             try:
                 record = await asyncio.wait_for(self.obs_queue.queue.get(), timeout=0.05)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
             try:
                 await self._write_record(record)

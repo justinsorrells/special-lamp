@@ -1,5 +1,4 @@
 import asyncio
-import json
 import unittest
 
 from board_connection import BoardEndpoint, BoardTCPConnection
@@ -7,23 +6,8 @@ from controller import ControllerCore
 from observability import ObservabilityQueue
 from protocol import ErrorCode, MessageType, parse_message
 from state import BoardConnState
+from tests.conftest import async_wait_for, encode, ok_response
 from tests.test_controller_core import client_command, schema_for
-
-
-def encode(message):
-    return (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-
-
-def ok_response(board_seq, board_id="motor"):
-    return {
-        "type": "response",
-        "seq": board_seq,
-        "source": board_id,
-        "target": "controller",
-        "status": "ok",
-        "result": {"accepted": True},
-        "error": None,
-    }
 
 
 class FakeBoardTCPServer:
@@ -117,12 +101,7 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         return self.connection
 
     async def wait_for(self, predicate, timeout=1.0):
-        deadline = asyncio.get_running_loop().time() + timeout
-        while asyncio.get_running_loop().time() < deadline:
-            if predicate():
-                return
-            await asyncio.sleep(0.005)
-        self.fail("condition was not met before timeout")
+        await async_wait_for(predicate, timeout=timeout)
 
     async def test_controller_connects_to_fake_board_and_accepts_schema_push(self):
         self.start_connection()

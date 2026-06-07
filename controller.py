@@ -7,10 +7,11 @@ does not implement Unix sockets, TCP connections, Redis, GUI, or firmware.
 
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass, field
 import asyncio
-from typing import Any, Callable
+from collections import deque
+from collections.abc import Callable
+from dataclasses import dataclass, field
+from typing import Any
 
 from interfaces import BoardWriterHandle, send_estop
 from protocol import (
@@ -32,8 +33,8 @@ from state import (
     BoardConnState,
     BoardSeqCounter,
     BoardState,
-    ControllerState,
     CommandLatencyObservation,
+    ControllerState,
     PendingCommand,
 )
 
@@ -240,15 +241,15 @@ class ControllerCore:
             self._observe_board_state(runtime.state)
 
         observed_at = self._monotonic_time()
-        latency_ms = None
-        if entry.written_at is not None:
-            latency_ms = (observed_at - entry.written_at) * 1000
         board_proc_us = self._extract_board_proc_us(response)
-        if latency_ms is not None:
+        latency_ms = None
+        written_at = entry.written_at
+        if written_at is not None:
+            latency_ms = (observed_at - written_at) * 1000
             runtime.state.last_command_latency = CommandLatencyObservation(
                 board_seq=board_seq,
                 latency_ms=latency_ms,
-                controller_ts=entry.written_at,
+                controller_ts=written_at,
                 observed_at=observed_at,
                 board_proc_us=board_proc_us,
             )

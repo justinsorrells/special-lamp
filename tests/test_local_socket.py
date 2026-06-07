@@ -73,7 +73,10 @@ class LocalSocketBackpressureTests(unittest.IsolatedAsyncioTestCase):
         self.server = LocalUnixSocketServer(socket_path="/tmp/unbound-controller.sock", controller=self.controller)
 
     async def asyncTearDown(self):
-        await asyncio.gather(*(client.close(flush=False) for client in list(self.server.clients)), return_exceptions=True)
+        await asyncio.gather(
+            *(client.close(flush=False) for client in list(self.server.clients)),
+            return_exceptions=True,
+        )
         self.server.clients.clear()
 
     async def test_outbound_queue_depth_default_is_1000(self):

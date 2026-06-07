@@ -1,0 +1,7 @@
+# Development / verification tooling. Install into the project venv:
+#   python -m pip install -r requirements-dev.txt
+# Then run the gate from the repo root:
+#   python -m pytest && python tools/check_invariants.py && ruff check . && mypy .
+pytest==9.0.3
+ruff==0.15.16
+mypy==2.1.0

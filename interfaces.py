@@ -6,9 +6,10 @@ not open sockets, talk to Redis, implement firmware, or integrate a GUI.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Protocol
 import asyncio
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any, Protocol
 
 from protocol import build_estop_message, serialize_message
 

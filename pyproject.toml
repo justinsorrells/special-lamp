@@ -1,0 +1,62 @@
+# Tooling configuration for the Hyperloop board networking stack.
+# This is intentionally config-only: the repo stays a flat, runnable layout with
+# no build-system / packaging. See requirements-dev.txt for the pinned dev tools.
+
+[tool.ruff]
+target-version = "py313"  # newest stable target ruff supports; runtime is 3.14
+line-length = 120
+# Lint the maintained networking stack + its tests. The standalone demo UI and the
+# agent-orchestrator utility are pre-existing, separately maintained, and out of
+# scope for the core verification gate (they carry their own latent issues).
+extend-exclude = [".venv", "demos", "tools/agent_orchestrator"]
+
+[tool.ruff.lint]
+# Conservative, high-signal rule set. E/F = pyflakes+pycodestyle, I = import
+# sorting, UP = pyupgrade (keeps modern syntax), B = bugbear (likely-bug checks).
+select = ["E", "F", "I", "UP", "B"]
+# UP047 would rewrite reviewed helpers to PEP-695 generic syntax (def f[T](...));
+# that is stylistic, not a correctness gain, so the existing TypeVar form stays.
+ignore = ["UP047"]
+
+[tool.mypy]
+python_version = "3.13"  # mypy target; runtime is 3.14
+warn_unused_ignores = true
+warn_redundant_casts = true
+# The repo is a flat layout (top-level modules + a tests/ package without
+# __init__.py); these let `mypy .` resolve modules without duplicate-name errors.
+namespace_packages = true
+explicit_package_bases = true
+mypy_path = "."
+# Strict typing is required on the core command-path / observability modules only.
+# demos/ and tests/ stay loosely typed for fast iteration (see per-module overrides).
+disallow_untyped_defs = false
+# The agent-orchestrator utility is a flat script package without __init__.py,
+# which confuses mypy's module resolution; it is out of scope for the core gate.
+exclude = [
+    "tools/agent_orchestrator/",
+    "demos/",
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "protocol",
+    "state",
+    "interfaces",
+    "controller",
+    "board_connection",
+    "local_socket",
+    "observability",
+]
+disallow_untyped_defs = true
+
+[[tool.mypy.overrides]]
+# Demos use third-party libs without stubs and are not part of the verified core.
+module = ["demos.*"]
+ignore_errors = true
+
+[[tool.mypy.overrides]]
+# The agent-orchestrator utility is out of scope for the core type gate, but it is
+# imported by its test, so it must be ignored here too (exclude alone cannot drop a
+# transitively-imported module).
+module = ["tools.agent_orchestrator.*"]
+ignore_errors = true

@@ -6,11 +6,10 @@ not implement sockets, Redis access, firmware behavior, or GUI integration.
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
-import asyncio
-
 
 DEFAULT_COMMAND_FIFO_DEPTH = 6
 DEFAULT_COMMAND_TIMEOUT_S = 2.0
@@ -140,7 +139,7 @@ class BoardStateRecord:
     telemetry_sample_count: int = 0
 
     @classmethod
-    def from_board_state(cls, state: BoardState) -> "BoardStateRecord":
+    def from_board_state(cls, state: BoardState) -> BoardStateRecord:
         return cls(
             board_id=state.board_id,
             conn_state=state.conn_state,
@@ -187,7 +186,7 @@ class SystemStateRecord:
     connected_count: int
 
     @classmethod
-    def from_system_state(cls, state: SystemState) -> "SystemStateRecord":
+    def from_system_state(cls, state: SystemState) -> SystemStateRecord:
         return cls(
             estop_active=state.estop_active,
             connected_count=state.connected_count,

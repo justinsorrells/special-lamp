@@ -281,10 +281,22 @@ class ProtocolContractTests(unittest.TestCase):
     def test_missing_and_invalid_fields_return_contract_error_codes(self):
         cases = [
             ({"seq": 1}, ErrorCode.MISSING_FIELD),
-            ({"type": "command", "seq": 1, "source": "gui", "target": "board", "command": "x", "args": []}, ErrorCode.INVALID_TYPE),
-            ({"type": "response", "seq": 1, "source": "board", "target": "controller", "status": "error", "result": None, "error": {"code": "NOT_A_CODE", "message": "bad"}}, ErrorCode.INVALID_TYPE),
-            ({"type": "schema", "seq": 1, "source": "board", "target": "controller", "protocol_version": "1", "schema": {"commands": {"move": {"args": {}, "blocked_by_estop": "yes"}}}}, ErrorCode.INVALID_TYPE),
-            ({"type": "event", "source": "board", "target": "controller", "event": "estop_ack", "details": {"state": "unsafe"}}, ErrorCode.INVALID_TYPE),
+            (
+                {"type": "command", "seq": 1, "source": "gui", "target": "board", "command": "x", "args": []},
+                ErrorCode.INVALID_TYPE,
+            ),
+            (
+                {"type": "response", "seq": 1, "source": "board", "target": "controller", "status": "error", "result": None, "error": {"code": "NOT_A_CODE", "message": "bad"}},  # noqa: E501
+                ErrorCode.INVALID_TYPE,
+            ),
+            (
+                {"type": "schema", "seq": 1, "source": "board", "target": "controller", "protocol_version": "1", "schema": {"commands": {"move": {"args": {}, "blocked_by_estop": "yes"}}}},  # noqa: E501
+                ErrorCode.INVALID_TYPE,
+            ),
+            (
+                {"type": "event", "source": "board", "target": "controller", "event": "estop_ack", "details": {"state": "unsafe"}},  # noqa: E501
+                ErrorCode.INVALID_TYPE,
+            ),
         ]
         for message, expected_code in cases:
             with self.subTest(message=message):

@@ -8,11 +8,11 @@ later controller components.
 
 from __future__ import annotations
 
+import json
+from collections.abc import MutableMapping
 from dataclasses import dataclass
 from enum import StrEnum
-import json
-from typing import Any, MutableMapping, TypeVar
-
+from typing import Any, TypeVar
 
 PROTOCOL_VERSION = "1"
 CONTROLLER_MAX_LINE_BYTES = 8 * 1024
@@ -389,7 +389,11 @@ def _validate_response(message: dict[str, Any]) -> None:
             raise ProtocolValidationError(ErrorCode.INVALID_TYPE, "COMMAND_TIMEOUT must use timeout status")
     if "result" in message and message["result"] is not None and not isinstance(message["result"], dict):
         raise ProtocolValidationError(ErrorCode.INVALID_TYPE, "result must be an object or null")
-    if "controller_ts" in message and message["controller_ts"] is not None and not isinstance(message["controller_ts"], int | float):
+    if (
+        "controller_ts" in message
+        and message["controller_ts"] is not None
+        and not isinstance(message["controller_ts"], int | float)
+    ):
         raise ProtocolValidationError(ErrorCode.INVALID_TYPE, "controller_ts must be numeric")
 
 

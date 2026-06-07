@@ -10,7 +10,6 @@ from local_socket import LocalUnixSocketServer
 from protocol import ErrorCode, MessageType
 from tests.test_controller_core import client_command, schema_for
 
-
 TERMINAL_STATUSES = {"ok", "error", "timeout"}
 
 

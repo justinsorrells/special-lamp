@@ -8,8 +8,8 @@ Unix socket server, Redis, GUI integration, firmware, or webapp behavior.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 import asyncio
+from dataclasses import dataclass
 from typing import Any
 
 from controller import ControllerCore
@@ -136,7 +136,7 @@ class BoardTCPConnection:
                 await self.controller.send_estop_to_board(self.endpoint.board_id)
 
             await self._read_loop(reader)
-        except (ConnectionError, OSError, asyncio.TimeoutError):
+        except (TimeoutError, ConnectionError, OSError):
             # Future metrics hook: distinguish registration_timeouts from connect/read failures.
             self.controller.set_board_state(self.endpoint.board_id, BoardConnState.FAULTED)
         finally:
