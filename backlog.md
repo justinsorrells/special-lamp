@@ -21,7 +21,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Implement Redis telemetry/logging integration
+* [x] Task: Implement Redis telemetry/logging integration
 
   ## Goal
 
