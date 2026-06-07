@@ -78,6 +78,7 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
             "heartbeat_acks_missed",
             "malformed_heartbeat_acks",
             "late_heartbeat_acks",
+            "telemetry_liveness_timeouts",
         }
 
         self.assertEqual(set(snapshot), expected_counters)

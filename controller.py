@@ -67,6 +67,7 @@ class ControllerCounters:
     heartbeat_acks_missed: int = 0
     malformed_heartbeat_acks: int = 0
     late_heartbeat_acks: int = 0
+    telemetry_liveness_timeouts: int = 0
 
     def increment(self, name: str, amount: int = 1) -> None:
         if name not in self._counter_names():
@@ -713,6 +714,44 @@ class ControllerCore:
         runtime.state.mark_heartbeat_disabled()
         self._observe_board_state(runtime.state)
 
+    def monotonic_time(self) -> float:
+        return self._monotonic_time()
+
+    def record_board_inbound(
+        self,
+        board_id: str,
+        *,
+        received_at: float | None = None,
+    ) -> None:
+        runtime = self._boards.get(board_id)
+        if runtime is None:
+            return
+        if received_at is None:
+            received_at = self._monotonic_time()
+        runtime.state.last_seen = received_at
+        self._observe_board_state(runtime.state)
+
+    def record_telemetry_liveness_timeout(
+        self,
+        board_id: str,
+        *,
+        elapsed_s: float,
+        timeout_s: float,
+    ) -> None:
+        self.counters.increment("telemetry_liveness_timeouts")
+        self.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "telemetry_liveness_timeout",
+                "details": {
+                    "board_id": board_id,
+                    "elapsed_s": elapsed_s,
+                    "timeout_s": timeout_s,
+                },
+            }
+        )
+
     def fifo_depth_for(self, board_id: str) -> int:
         return len(self._boards[board_id].fifo)
 
@@ -878,8 +917,8 @@ class ControllerCore:
             return
         if received_at is None:
             received_at = self._monotonic_time()
-        runtime.state.last_telemetry = message["telemetry"]
         runtime.state.last_seen = received_at
+        runtime.state.last_telemetry = message["telemetry"]
         runtime.state.telemetry_rate.observe(received_at)
         self._observe_board_telemetry(message, runtime.state)
         self._observe_board_state(runtime.state)

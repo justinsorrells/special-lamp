@@ -2,13 +2,20 @@ import asyncio
 import unittest
 from collections import deque
 
-from board_connection import BoardEndpoint, BoardTCPConnection, HeartbeatConfig, ReconnectBackoff
+from board_connection import (
+    BoardEndpoint,
+    BoardTCPConnection,
+    HeartbeatConfig,
+    LivenessConfig,
+    ReconnectBackoff,
+)
 from controller import ControllerCore
 from observability import ObservabilityQueue
 from protocol import ErrorCode, MessageType, parse_message
 from state import BoardConnState
 from tests.conftest import (
     FakeBoardWriter,
+    FakeClock,
     async_wait_for,
     client_command,
     encode,
@@ -113,6 +120,7 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             BoardEndpoint("motor", "127.0.0.1", self.server.port),
             self.controller,
             reconnect_delay_s=0.02,
+            liveness=LivenessConfig(enabled=False),
         )
 
     async def asyncTearDown(self):
@@ -389,6 +397,27 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["late_heartbeat_acks"], 1)
         self.assertEqual(snapshot["malformed_heartbeat_acks"], 1)
 
+    async def test_liveness_watchdog_faults_stale_tcp_connection_and_reconnects(self):
+        await self.connection.stop()
+        self.connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", self.server.port),
+            self.controller,
+            reconnect_delay_s=0.01,
+            liveness=LivenessConfig(timeout_s=0.03),
+        )
+        self.start_connection()
+        await self.connection.wait_registered()
+
+        await self.wait_for(
+            lambda: self.controller.metrics_snapshot()["telemetry_liveness_timeouts"] >= 1,
+            timeout=0.5,
+        )
+        await self.wait_for(lambda: self.server.connections >= 2, timeout=0.5)
+        await self.connection.wait_registered(timeout=0.5)
+
+        self.assertEqual(self.controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
+        self.assertGreaterEqual(self.server.connections, 2)
+
 
 class ReconnectBackoffTests(unittest.TestCase):
     def test_full_jitter_uses_exponential_ceiling_and_caps(self):
@@ -603,6 +632,125 @@ class BoardConnectionUnitTests(unittest.IsolatedAsyncioTestCase):
         board = controller.state.boards["motor"]
         self.assertTrue(board.rx_path_suspect)
         self.assertEqual(controller.metrics_snapshot()["late_heartbeat_acks"], 1)
+
+    async def test_liveness_timeout_faults_board_and_fails_pending_commands(self):
+        clock = FakeClock(100.0)
+        controller = ControllerCore(expected_boards={"motor"}, monotonic_clock=clock)
+        writer = FakeBoardWriter()
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", 1),
+            controller,
+            liveness=LivenessConfig(timeout_s=0.25),
+        )
+        connection._record_valid_inbound(
+            {
+                "type": "schema",
+                "seq": 1,
+                "source": "motor",
+                "target": "controller",
+                "protocol_version": "1",
+                "schema": {"commands": {}, "telemetry": {}, "state": {}},
+            }
+        )
+        first = asyncio.create_task(controller.route_command(client_command(seq=70)))
+        await async_wait_for(lambda: len(writer.messages) == 1, timeout=0.5)
+        second = asyncio.create_task(controller.route_command(client_command(seq=71)))
+        await async_wait_for(lambda: controller.fifo_depth_for("motor") == 1, timeout=0.5)
+
+        clock.advance(0.251)
+        faulted = await connection._fault_if_liveness_expired()
+
+        self.assertTrue(faulted)
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.FAULTED)
+        first_response = await asyncio.wait_for(first, timeout=0.2)
+        second_response = await asyncio.wait_for(second, timeout=0.2)
+        self.assertEqual(first_response["error"]["code"], ErrorCode.BOARD_UNAVAILABLE.value)
+        self.assertEqual(second_response["error"]["code"], ErrorCode.BOARD_UNAVAILABLE.value)
+        snapshot = controller.metrics_snapshot()
+        self.assertEqual(snapshot["telemetry_liveness_timeouts"], 1)
+        self.assertEqual(snapshot["board_disconnects"], 1)
+        self.assertEqual(controller.pending_count(), 0)
+        self.assertEqual(controller.fifo_depth_for("motor"), 0)
+
+    async def test_healthy_telemetry_keeps_registered_before_liveness_threshold(self):
+        clock = FakeClock(150.0)
+        controller = ControllerCore(expected_boards={"motor"}, monotonic_clock=clock)
+        controller.register_board("motor", writer=FakeBoardWriter(), schema=schema_for("motor"))
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", 1),
+            controller,
+            liveness=LivenessConfig(timeout_s=0.25),
+        )
+        telemetry = {
+            "type": "telemetry",
+            "seq": 1,
+            "source": "motor",
+            "target": "controller",
+            "telemetry": {"rpm": 100},
+        }
+
+        connection._record_valid_inbound(telemetry)
+        controller.record_board_telemetry(telemetry)
+        clock.advance(0.249)
+
+        self.assertFalse(await connection._fault_if_liveness_expired())
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
+        self.assertEqual(controller.state.boards["motor"].last_telemetry, {"rpm": 100})
+
+    async def test_any_valid_inbound_packet_resets_liveness_deadline(self):
+        clock = FakeClock(200.0)
+        controller = ControllerCore(expected_boards={"motor"}, monotonic_clock=clock)
+        controller.register_board("motor", writer=FakeBoardWriter(), schema=schema_for("motor"))
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", 1),
+            controller,
+            liveness=LivenessConfig(timeout_s=0.25),
+        )
+        connection._record_valid_inbound(
+            {
+                "type": "telemetry",
+                "seq": 1,
+                "source": "motor",
+                "target": "controller",
+                "telemetry": {"rpm": 100},
+            }
+        )
+        clock.advance(0.20)
+        connection._record_valid_inbound(ok_response(42, board_id="motor"))
+        clock.advance(0.20)
+
+        self.assertFalse(await connection._fault_if_liveness_expired())
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
+        self.assertEqual(controller.metrics_snapshot()["telemetry_liveness_timeouts"], 0)
+
+        clock.advance(0.051)
+        self.assertTrue(await connection._fault_if_liveness_expired())
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.FAULTED)
+
+    async def test_liveness_fault_does_not_depend_on_observability(self):
+        clock = FakeClock(300.0)
+        controller = ControllerCore(expected_boards={"motor"}, monotonic_clock=clock, observability=None)
+        controller.register_board("motor", writer=FakeBoardWriter(), schema=schema_for("motor"))
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", 1),
+            controller,
+            liveness=LivenessConfig(timeout_s=0.25),
+        )
+        connection._record_valid_inbound(
+            {
+                "type": "event",
+                "source": "motor",
+                "target": "controller",
+                "event": "state_changed",
+                "details": {},
+            }
+        )
+        clock.advance(0.251)
+
+        self.assertTrue(await connection._fault_if_liveness_expired())
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.FAULTED)
+        self.assertEqual(controller.metrics_snapshot()["telemetry_liveness_timeouts"], 1)
 
 
 if __name__ == "__main__":

@@ -26,7 +26,7 @@ from protocol import (
     parse_message,
     serialize_message,
 )
-from state import BoardConnState
+from state import DEFAULT_BOARD_LIVENESS_TIMEOUT_S, BoardConnState
 
 DEFAULT_RECONNECT_BACKOFF_BASE_S = 0.5
 DEFAULT_RECONNECT_BACKOFF_FACTOR = 2.0
@@ -92,6 +92,16 @@ class HeartbeatConfig:
             raise ValueError("heartbeat suspect threshold must be positive")
 
 
+@dataclass(frozen=True)
+class LivenessConfig:
+    enabled: bool = True
+    timeout_s: float = DEFAULT_BOARD_LIVENESS_TIMEOUT_S
+
+    def __post_init__(self) -> None:
+        if self.timeout_s <= 0:
+            raise ValueError("liveness timeout must be positive")
+
+
 class StreamBoardWriter(BoardWriterHandle):
     """Serialized newline-JSON writer for one board stream."""
 
@@ -127,6 +137,7 @@ class BoardTCPConnection:
         reconnect_backoff: ReconnectBackoff | None = None,
         registration_timeout_s: float = 2.0,
         heartbeat: HeartbeatConfig | None = None,
+        liveness: LivenessConfig | None = None,
     ):
         self.endpoint = endpoint
         self.controller = controller
@@ -143,14 +154,19 @@ class BoardTCPConnection:
         )
         self.registration_timeout_s = registration_timeout_s
         self.heartbeat = HeartbeatConfig() if heartbeat is None else heartbeat
+        self.liveness = LivenessConfig() if liveness is None else liveness
         self._stop = asyncio.Event()
         self._registered = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._heartbeat_task: asyncio.Task[None] | None = None
+        self._liveness_task: asyncio.Task[None] | None = None
+        self._liveness_refreshed = asyncio.Event()
         self._heartbeat_ack = asyncio.Event()
         self._heartbeat_seq = 0
         self._pending_heartbeat_seq: int | None = None
         self._stream_writer: StreamBoardWriter | None = None
+        self._last_inbound_at: float | None = None
+        self._liveness_fault_reported = False
 
     def start(self) -> None:
         if self._task is not None:
@@ -160,6 +176,7 @@ class BoardTCPConnection:
     async def stop(self) -> None:
         self._stop.set()
         await self._stop_heartbeat()
+        await self._stop_liveness()
         if self._stream_writer is not None:
             await self._stream_writer.close()
         if self._task is not None:
@@ -183,6 +200,8 @@ class BoardTCPConnection:
 
     async def _connect_and_read_once(self) -> None:
         self._registered.clear()
+        self._last_inbound_at = None
+        self._liveness_fault_reported = False
         self.controller.set_board_state(self.endpoint.board_id, BoardConnState.CONNECTING)
         reader: asyncio.StreamReader | None = None
         raw_writer: asyncio.StreamWriter | None = None
@@ -206,6 +225,7 @@ class BoardTCPConnection:
             if schema.get("source") != self.endpoint.board_id:
                 self.controller.set_board_state(self.endpoint.board_id, BoardConnState.FAULTED)
                 return
+            self._record_valid_inbound(schema)
 
             try:
                 self.controller.register_board(
@@ -220,6 +240,7 @@ class BoardTCPConnection:
             if self.controller.state.system.estop_active:
                 await self.controller.send_estop_to_board(self.endpoint.board_id)
             self._start_heartbeat(stream_writer)
+            self._start_liveness()
 
             await self._read_loop(reader)
         except (TimeoutError, ConnectionError, OSError):
@@ -227,6 +248,7 @@ class BoardTCPConnection:
             self.controller.set_board_state(self.endpoint.board_id, BoardConnState.FAULTED)
         finally:
             await self._stop_heartbeat()
+            await self._stop_liveness()
             self._registered.clear()
             self._stream_writer = None
             if raw_writer is not None:
@@ -235,7 +257,7 @@ class BoardTCPConnection:
                     await raw_writer.wait_closed()
                 except ConnectionError:
                     pass
-            if not self._stop.is_set():
+            if not self._stop.is_set() and not self._liveness_fault_reported:
                 await self.controller.board_down(self.endpoint.board_id)
 
     async def _read_loop(self, reader: asyncio.StreamReader) -> None:
@@ -243,6 +265,7 @@ class BoardTCPConnection:
             message = await self._read_valid_message(reader)
             if message is None:
                 return
+            self._record_valid_inbound(message)
             await self._handle_message(message)
 
     async def _read_valid_message(self, reader: asyncio.StreamReader) -> dict[str, Any] | None:
@@ -270,6 +293,14 @@ class BoardTCPConnection:
                 }
             )
         return None
+
+    def _record_valid_inbound(self, message: dict[str, Any]) -> None:
+        if message.get("source") != self.endpoint.board_id:
+            return
+        received_at = self.controller.monotonic_time()
+        self._last_inbound_at = received_at
+        self.controller.record_board_inbound(self.endpoint.board_id, received_at=received_at)
+        self._liveness_refreshed.set()
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
         message_type = message["type"]
@@ -301,6 +332,70 @@ class BoardTCPConnection:
         if self._heartbeat_task is not None:
             return
         self._heartbeat_task = asyncio.create_task(self._heartbeat_loop(writer))
+
+    def _start_liveness(self) -> None:
+        if not self.liveness.enabled:
+            return
+        if self._liveness_task is not None:
+            return
+        self._liveness_task = asyncio.create_task(self._liveness_loop())
+
+    async def _stop_liveness(self) -> None:
+        task = self._liveness_task
+        self._liveness_task = None
+        self._liveness_refreshed.set()
+        if task is None:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    async def _liveness_loop(self) -> None:
+        try:
+            while not self._stop.is_set():
+                if await self._fault_if_liveness_expired():
+                    return
+                remaining_s = self._seconds_until_liveness_timeout()
+                if remaining_s is None:
+                    await self._liveness_refreshed.wait()
+                    self._liveness_refreshed.clear()
+                    continue
+                try:
+                    await asyncio.wait_for(self._liveness_refreshed.wait(), timeout=remaining_s)
+                    self._liveness_refreshed.clear()
+                except TimeoutError:
+                    pass
+        except asyncio.CancelledError:
+            raise
+
+    def _seconds_until_liveness_timeout(self) -> float | None:
+        if self._last_inbound_at is None:
+            return None
+        elapsed_s = self.controller.monotonic_time() - self._last_inbound_at
+        return max(0.0, self.liveness.timeout_s - elapsed_s)
+
+    async def _fault_if_liveness_expired(self) -> bool:
+        if not self.liveness.enabled or self._last_inbound_at is None:
+            return False
+        board = self.controller.state.boards[self.endpoint.board_id]
+        if board.conn_state is not BoardConnState.REGISTERED:
+            return False
+        elapsed_s = self.controller.monotonic_time() - self._last_inbound_at
+        if elapsed_s <= self.liveness.timeout_s:
+            return False
+
+        self._liveness_fault_reported = True
+        self.controller.record_telemetry_liveness_timeout(
+            self.endpoint.board_id,
+            elapsed_s=elapsed_s,
+            timeout_s=self.liveness.timeout_s,
+        )
+        await self.controller.board_down(self.endpoint.board_id)
+        if self._stream_writer is not None:
+            await self._stream_writer.close()
+        return True
 
     async def _stop_heartbeat(self) -> None:
         task = self._heartbeat_task
