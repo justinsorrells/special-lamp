@@ -612,7 +612,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Implement subprocess timeouts in orchestrator command execution
+* [x] Task: Implement subprocess timeouts in orchestrator command execution
 
   ## Goal
 
