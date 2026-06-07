@@ -8,4 +8,5 @@ __pycache__/
 .venv/
 
 .DS_Store
-
+.agent_runs/
+tools/agent_orchestrator/scratch_task.md

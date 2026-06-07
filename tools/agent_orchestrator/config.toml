@@ -1,0 +1,31 @@
+[agents.codex]
+command = "codex"
+mode = "exec"
+model = "gpt-5.5"
+
+[agents.claude]
+command = "claude"
+mode = "print"
+model = "opus-4.8"
+
+[agents.antigravity]
+command = "antigravity"
+model = "gemini-3.5-flash"
+
+[repo]
+main_branch = "main"
+agent_branch_prefix = "agent/"
+require_clean_worktree = true
+never_auto_push = true
+never_auto_merge = true
+
+[checks]
+pytest = true
+compileall = true
+ruff = "auto"
+mypy = "auto"
+
+[limits]
+max_changed_files = 30
+max_diff_lines = 2500
+max_task_cycles = 1
