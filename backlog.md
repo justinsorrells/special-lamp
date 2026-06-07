@@ -628,7 +628,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Active enforcement of never_auto_push and never_auto_merge
+* [x] Task: Active enforcement of never_auto_push and never_auto_merge
 
   ## Goal
 
