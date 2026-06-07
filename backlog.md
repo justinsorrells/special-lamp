@@ -655,4 +655,277 @@ General rules for every task:
   * README verdict-robustness claim matches actual behavior.
   * Add tests for the relaxed-but-anchored parsing and the agy-verdict extraction path.
 
+---
+
+<!-- V1 Networking contract-coverage backlog (T1–T8). Seeded from a 5-review consensus
+     audit (canonical source: ~/contract_FINAL_backlog.md), ratified by Codex + Antigravity.
+     Frozen contract `docs/contracts/V1_Networking_Decisions.md` is unchanged. -->
+
+* [ ] Task: Implement exponential reconnect backoff with full jitter (contract 1.4)
+
+  ## Goal
+
+  Replace the fixed reconnect delay in `BoardTCPConnection` with contract-1.4 exponential backoff plus full jitter. Currently `board_connection.py` uses a fixed `reconnect_delay_s = 0.05` (`board_connection.py:84,122`) — no exponential growth, jitter, cap, or reset-on-registration.
+
+  ## Files
+
+  * `board_connection.py`
+  * `tests/test_board_connection.py`
+
+  ## Requirements
+
+  * AWS full jitter: `sleep = uniform(0, min(5.0, 0.5 * (2 ** attempt)))` — base 500 ms, factor 2, cap 5 s.
+  * Reset the attempt counter to base on successful registration (`REGISTERED`).
+  * Retries are infinite (no give-up state in V1).
+  * Stop/shutdown must cancel the backoff sleep cleanly (no hang).
+  * Inject random/clock so tests are deterministic (no real sleeps).
+
+  ## Tests should cover
+
+  * Delay grows exponentially and is capped at 5 s.
+  * Each delay is within full-jitter bounds.
+  * Backoff resets to base after successful registration.
+  * Stop during backoff cancels the sleep promptly.
+
+  ## Validation
+
+  ```bash
+  python -m pytest
+  python tools/check_invariants.py
+  ruff check .
+  mypy .
+  ```
+
+---
+
+* [ ] Task: Implement telemetry-loss liveness FAULT watchdog (contract 1.6)
+
+  ## Goal
+
+  Telemetry doubles as the board->controller liveness signal (contract 1.6): mark a board `FAULTED` after ~5 missed 50 ms frames (~250 ms with no inbound message). Today `last_seen` is recorded (`controller.py:882`, `state.py`) but nothing watches it, so a board whose telemetry/RX wedges while TCP stays open remains `REGISTERED` and keeps receiving commands. `FAULTED` currently fires only on read error / registration timeout (`board_connection.py:144-166`).
+
+  ## Files
+
+  * `board_connection.py`, `controller.py`, `state.py`
+  * `tests/test_board_connection.py`, `tests/test_controller_core.py`
+
+  ## Requirements
+
+  * Per-board watchdog: if `monotonic now - last_inbound > ~250 ms` (configurable), transition to `FAULTED` and call `board_down(board_id)` so pending + FIFO commands resolve with `BOARD_UNAVAILABLE` (pop-wins).
+  * **Settled decision:** any valid inbound board packet (not telemetry only) resets the liveness deadline.
+  * Keep orthogonal to the optional heartbeat / `rx_path_suspect` behavior.
+  * Liveness decisions must not depend on Redis/observability.
+  * Deterministic/injectable clock; no real sleeps.
+
+  ## Do not
+
+  * Solicit telemetry. Merge connection state with safety/e-stop state. Add new terminal statuses.
+
+  ## Tests should cover
+
+  * Healthy telemetry keeps the board `REGISTERED`.
+  * Silence beyond threshold → `FAULTED` + pending/FIFO failed with `BOARD_UNAVAILABLE`.
+  * Any inbound packet resets the deadline.
+  * Redis down/disabled does not affect the liveness decision.
+  * Reconnect recovers cleanly.
+
+  ## Validation
+
+  ```bash
+  python -m pytest
+  python tools/check_invariants.py
+  ruff check .
+  mypy .
+  ```
+
+---
+
+* [ ] Task: Add controller runtime entrypoint, configuration, and signal handling (contract 0, 6.9)
+
+  ## Goal
+
+  There is no production controller runner: the stack exists as components (`ControllerCore`, `BoardTCPConnection`, `LocalUnixSocketServer`, observability) with no module that wires them, loads config, and installs OS signal handlers. (`shutdown()` exists but nothing calls it from a signal handler; non-test `__main__` exists only under `demos/`.)
+
+  ## Files
+
+  * New `tools/run_controller.py` (or `controller_main.py`)
+  * New non-authoritative **Configuration Contract** doc (NOT under `docs/contracts/`)
+  * `local_socket.py` (touch as needed)
+  * Tests under `tests/`
+
+  ## Requirements
+
+  * Load static config: board ids + host/port (statically configured; unknown ids rejected, contract 0/1.3), Unix socket path, optional Redis params, heartbeat enablement, timeout/FIFO/backoff/liveness knobs.
+  * Start one `BoardTCPConnection` per configured board, the `LocalUnixSocketServer`, and the Redis telemetry worker when configured.
+  * Unix socket lifecycle (already implemented in `local_socket.py:193-226`, wire it): create mode `0600`; unlink a dead/stale socket; refuse to start if a live controller owns the path.
+  * SIGTERM/SIGINT → existing graceful `shutdown()` (stop accepting, bounded in-flight drain, fail remainder `CONTROLLER_SHUTDOWN`, close board + client streams). Idempotent.
+
+  ## Tests should cover
+
+  * Stale dead socket unlinked and recreated; live controller on the path → refuse-to-start; socket mode `0600`.
+  * SIGTERM path: new requests refused, in-flight drained, remainder `CONTROLLER_SHUTDOWN`.
+  * Unknown/duplicate board id rejected.
+
+  ## Validation
+
+  ```bash
+  python -m pytest
+  python tools/check_invariants.py
+  ruff check .
+  mypy .
+  ```
+
+---
+
+* [ ] Task: Complete section 4 metrics and latency percentiles (contract 4)
+
+  ## Goal
+
+  The minimum metrics set (contract 4) is incomplete: `reconnect_count` and `protocol_version_mismatches` are absent, and only the last command latency is tracked (`state.py:29,167`) instead of per-command p50/p95/p99.
+
+  ## Files
+
+  * `controller.py`, `state.py`, `observability.py`
+  * `tests/test_controller_core.py`, `tests/test_observability.py`
+
+  ## Requirements
+
+  * Add to `metrics_snapshot()`: `reconnect_count`, `registration_timeouts`, `protocol_version_mismatches`.
+  * **Settled semantics:** `reconnect_count` increments on a successful TCP open; `registration_timeouts` increments when a board connects but sends no schema within the 2 s registration window; `protocol_version_mismatches` on a 1.16 fault.
+  * Track per-board command RTT in a bounded buffer (e.g. `deque(maxlen=1000)`) and expose p50/p95/p99 computed from the monotonic `controller_ts`.
+  * Mirror added fields to Redis state/observability if state records are extended.
+  * No new terminal statuses; must not affect the command path.
+
+  ## Tests should cover
+
+  * Percentiles correct over a known latency sample; latency window bounded.
+  * Each counter increments per its defined trigger.
+  * Metrics snapshot is read-only/copy-safe; command routing unaffected.
+
+  ## Validation
+
+  ```bash
+  python -m pytest
+  python tools/check_invariants.py
+  ruff check .
+  mypy .
+  ```
+
+---
+
+* [ ] Task: Replace legacy UDP demos with a contract-faithful TCP mock board and Unix-socket client
+
+  ## Goal
+
+  The `demos/` code is legacy UDP / direct-board (`demos/server/server.py:81` uses `SOCK_DGRAM`; `demos/client/client.py` is a `UDPClient`; `demos/webapp.py` talks UDP to boards), contradicting the frozen topology. No contract-faithful mock board (Agent 7) exists for real TCP/timing integration.
+
+  ## Files
+
+  * `demos/server/server.py` (→ TCP mock board), `demos/client/client.py`, optionally `demos/webapp.py`, `demos/*/README.md`
+
+  ## Requirements
+
+  * Mock board = TCP **server**: pushes schema on connect/reconnect (`protocol_version` + per-command `blocked_by_estop`), pushes 50 ms telemetry, responds to `command`s with newline-delimited JSON, emits `event: estop_ack` on `estop`, and supports injectable RX-wedged + TCP-disconnect failure modes.
+  * Local demo client: connects to the controller Unix socket, sends `command` / `estop_reset`, and continuously reads both `response` and unsolicited `event`. Never talks directly to a board.
+  * Optional webapp: talks only to the controller Unix socket.
+
+  ## Do not
+
+  * Reintroduce UDP into the command path. Make the GUI/client talk directly to boards. Invent new protocol fields/statuses.
+
+  ## Tests should cover
+
+  * E2E smoke: `client -> Unix socket -> controller -> TCP mock board -> response`.
+  * E-stop path: broadcast `estop` and receive `estop_ack`.
+  * Unknown-target / timeout / board-disconnect smoke paths.
+
+  ## Validation
+
+  ```bash
+  python -m pytest
+  python tools/check_invariants.py
+  ruff check .
+  mypy .
+  ```
+
+---
+
+* [ ] Task: Add e-stop and lifecycle integration proof tests (contract 1.7, 1.13, 6.9)
+
+  ## Goal
+
+  Core e-stop pieces are covered, but high-value *combinations* and runtime paths are not directly proven. (Note: two-client same-`seq`, two-board `board_seq=1`, and large-schema-accepted are already covered at the protocol/unit level in `tests/test_protocol_contracts.py` — do not re-add; expand only to runtime/e2e.)
+
+  ## Files
+
+  * `tests/` (likely `test_controller_core.py`, `test_board_connection.py`, `test_observability.py`, integration tests)
+
+  ## Tests should cover
+
+  * **Redis outage during `trigger_estop`:** latch sets, FIFOs clear with `ESTOP_ACTIVE`, boards receive `estop`, local clients notified, and no exception escapes — e-stop never depends on Redis (1.7/1.13).
+  * **Reconnect during active e-stop:** board reaches `REGISTERED` while `estop_active`, controller re-sends out-of-band `estop`, gated commands rejected, a `blocked_by_estop=false` command still dispatches, `estop_ack` false until the event.
+  * **Telemetry-loss → FAULTED end-to-end** (pairs with the liveness task).
+  * **SIGTERM end-to-end** via the runtime entrypoint (pairs with the entrypoint task).
+  * **Test-tier visibility:** make the socket-bind integration tests (which `raise unittest.SkipTest` on `PermissionError`) an explicit, reported tier so a CI skip is intentional and visible, not silent.
+
+  ## Validation
+
+  ```bash
+  python -m pytest
+  python tools/check_invariants.py
+  ruff check .
+  mypy .
+  ```
+
+---
+
+* [ ] Task: Author companion contracts and guides
+
+  ## Goal
+
+  Add the missing developer/operator docs that current implementation work needs. All non-authoritative; `docs/contracts/V1_Networking_Decisions.md` remains authoritative and is not edited.
+
+  ## Scope (ranked)
+
+  * **Must-have:** Configuration Contract (board endpoints, socket path, Redis, heartbeat, timeout/FIFO/backoff/liveness knobs — pairs with the entrypoint task); Contract Coverage Matrix (each contract section -> impl / unit test / integration test / static check / doc, gaps marked); E-stop Reset Clearance Contract; Contract-Level Integration Test Plan.
+  * **Useful:** Local Client Developer Guide (full-duplex `response` vs `event`, seq semantics, error codes, backpressure); Redis Observability Schema (hash/stream/pub-sub field shapes, `event_id`).
+  * **Not needed:** Error-Code Mapping Table (already in 3.11), Heartbeat Wire Contract. Defer Board Library API + QNEthernet notes to firmware work.
+
+  ## Operator decision required (E-stop Reset Clearance Contract)
+
+  Proposed (PENDING OPERATOR RATIFICATION — safety-adjacent): the controller does **not** poll boards for physical safety; it accepts `estop_reset` from the local client, and the client/GUI is responsible for confirming the physical interlock is cleared. Document ownership, sync/async behavior, and failure behavior. Do not implement reset-clearance logic until ratified.
+
+  ## Validation
+
+  Docs only; no runtime tests unless a docs/coverage checker is added.
+
+---
+
+* [ ] Task: Repo hygiene — root contract duplicate, pytest path, stray-file guard
+
+  ## Goal
+
+  Close out repo-cleanliness gaps surfaced during the contract audit.
+
+  ## Requirements
+
+  * Remove the divergent **root** `V1_Networking_Decisions.md` (or replace with a one-line pointer to the canonical `docs/contracts/V1_Networking_Decisions.md`); do not modify the canonical copy.
+  * Add a `tools/check_invariants.py` rule that fails on a divergent duplicate contract file and on stray top-level review/brief markdown files.
+  * Pin pytest's import path so every invocation collects+runs the same 191 tests: add `[tool.pytest.ini_options]\npythonpath = ["."]` to `pyproject.toml`. (Today bare `pytest` errors at collection without the repo root on `sys.path`.)
+
+  ## Tests should cover
+
+  * Invariant checker flags a divergent duplicate contract file.
+  * `pytest -q` and `python -m pytest -q` both collect 191 tests from the repo root.
+  * Existing `pytest` / `check_invariants` / `ruff` / `mypy` still pass.
+
+  ## Validation
+
+  ```bash
+  python -m pytest
+  python tools/check_invariants.py
+  ruff check .
+  mypy .
+  ```
+
 
