@@ -9,11 +9,15 @@ from local_socket import LocalClientConnection, LocalUnixSocketServer
 from observability import ObservabilityQueue
 from protocol import ErrorCode, MessageType
 from state import BoardConnState
-from tests.test_controller_core import FakeBoardWriter, board_ok_response, client_command, schema_for
-
-
-def encode(message):
-    return (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+from tests.conftest import (
+    FakeBoardWriter,
+    client_command,
+    encode,
+    schema_for,
+)
+from tests.conftest import (
+    ok_response as board_ok_response,
+)
 
 
 async def read_json(reader):

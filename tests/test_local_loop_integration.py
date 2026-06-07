@@ -8,26 +8,14 @@ from board_connection import BoardEndpoint, BoardTCPConnection
 from controller import ControllerCore
 from local_socket import LocalUnixSocketServer
 from protocol import ErrorCode, MessageType
-from tests.test_controller_core import client_command, schema_for
+from tests.conftest import (
+    client_command,
+    encode,
+    ok_response,
+    schema_for,
+)
 
 TERMINAL_STATUSES = {"ok", "error", "timeout"}
-
-
-def encode(message):
-    return (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-
-
-def board_ok_response(board_command, *, board_id="motor"):
-    return {
-        "type": "response",
-        "seq": board_command["seq"],
-        "source": board_id,
-        "target": "controller",
-        "controller_ts": board_command.get("controller_ts"),
-        "status": "ok",
-        "result": {"accepted": True},
-        "error": None,
-    }
 
 
 async def read_raw_json_line(reader, *, timeout=0.8):
@@ -95,7 +83,15 @@ class FakeLoopBoardServer:
                         await writer.wait_closed()
                         return
                     if self.auto_respond:
-                        writer.write(encode(board_ok_response(message, board_id=self.board_id)))
+                        writer.write(
+                            encode(
+                                ok_response(
+                                    message["seq"],
+                                    self.board_id,
+                                    controller_ts=message.get("controller_ts"),
+                                )
+                            )
+                        )
                         await writer.drain()
                 elif message.get("type") == MessageType.ESTOP.value:
                     await self.commands.put(message)
@@ -244,7 +240,12 @@ class LocalLoopIntegrationTests(unittest.IsolatedAsyncioTestCase):
             await self.send_local(writer, client_command(seq=45))
             board_command = await asyncio.wait_for(self.board_server.commands.get(), timeout=0.8)
             response = await self.read_until_seq(reader, 45)
-            await self.board_server.send_to_latest(board_ok_response(board_command))
+            await self.board_server.send_to_latest(
+                ok_response(
+                    board_command["seq"],
+                    controller_ts=board_command.get("controller_ts"),
+                )
+            )
 
             await self.wait_for(lambda: self.controller.counters.unmatched_seq == 1)
             self.assertEqual(response["status"], "timeout")

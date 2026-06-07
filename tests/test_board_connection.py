@@ -6,8 +6,13 @@ from controller import ControllerCore
 from observability import ObservabilityQueue
 from protocol import ErrorCode, MessageType, parse_message
 from state import BoardConnState
-from tests.conftest import async_wait_for, encode, ok_response
-from tests.test_controller_core import client_command, schema_for
+from tests.conftest import (
+    async_wait_for,
+    client_command,
+    encode,
+    ok_response,
+    schema_for,
+)
 
 
 class FakeBoardTCPServer:
