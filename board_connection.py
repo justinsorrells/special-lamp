@@ -165,11 +165,12 @@ class BoardTCPConnection:
             except asyncio.IncompleteReadError:
                 return None
             except asyncio.LimitOverrunError:
-                # Future metrics hook: count this separately from EOF as a line-limit fault.
+                self.controller.record_malformed_board_message()
                 return None
             parsed = parse_message(line, max_line_bytes=CONTROLLER_MAX_LINE_BYTES)
             if parsed.ok:
                 return parsed.message
+            self.controller.record_malformed_board_message()
             self.controller.observe_controller_event(
                 {
                     "type": MessageType.EVENT.value,

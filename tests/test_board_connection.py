@@ -89,7 +89,10 @@ class FakeBoardTCPServer:
 class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.server = FakeBoardTCPServer()
-        await self.server.start()
+        try:
+            await self.server.start()
+        except PermissionError as exc:
+            raise unittest.SkipTest(f"TCP bind unavailable in this environment: {exc}") from exc
         self.controller = ControllerCore(expected_boards={"motor"})
         self.connection = BoardTCPConnection(
             BoardEndpoint("motor", "127.0.0.1", self.server.port),
@@ -154,6 +157,7 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 for event in events
             )
         )
+        self.assertGreaterEqual(self.controller.metrics_snapshot()["malformed_board_messages"], 1)
 
     async def test_board_disconnect_calls_board_down(self):
         self.start_connection()
@@ -163,6 +167,7 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for(
             lambda: self.controller.state.boards["motor"].conn_state == BoardConnState.FAULTED
         )
+        self.assertEqual(self.controller.metrics_snapshot()["board_disconnects"], 1)
 
     async def test_reconnect_accepts_schema_push_again(self):
         self.start_connection()
@@ -269,6 +274,23 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(rate.rate_hz)
         self.assertGreater(rate.rate_hz, 0.0)
         self.assertIsNotNone(rate.last_interval_ms)
+
+
+class BoardConnectionUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_malformed_board_message_counter_increments_without_tcp_socket(self):
+        controller = ControllerCore(expected_boards={"motor"})
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", 1),
+            controller,
+        )
+        reader = asyncio.StreamReader()
+        reader.feed_data(b"{bad-json\n")
+        reader.feed_eof()
+
+        message = await connection._read_valid_message(reader)
+
+        self.assertIsNone(message)
+        self.assertEqual(controller.metrics_snapshot()["malformed_board_messages"], 1)
 
 
 if __name__ == "__main__":

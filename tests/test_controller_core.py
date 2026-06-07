@@ -48,6 +48,39 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["result"]["board_seq"], board_seq)
         self.assertIsNone(controller.in_flight_for("motor"))
         self.assertEqual(controller.pending_count("motor"), 0)
+        self.assertEqual(controller.metrics_snapshot()["commands_completed_ok"], 1)
+
+    async def test_metrics_initialize_to_zero_and_snapshot_is_copy_safe(self):
+        controller = self.make_controller()
+
+        snapshot = controller.metrics_snapshot()
+        expected_counters = {
+            "obs_dropped",
+            "unmatched_seq",
+            "orphaned_response",
+            "board_busy_rejections",
+            "estop_rejections",
+            "malformed_client_messages",
+            "malformed_board_messages",
+            "client_disconnects",
+            "board_disconnects",
+            "command_timeouts",
+            "controller_shutdown_failures",
+            "redis_write_failures",
+            "local_event_dropped",
+            "critical_event_disconnects",
+            "late_board_responses",
+            "duplicate_board_responses",
+            "commands_completed_ok",
+            "commands_completed_error",
+            "commands_completed_timeout",
+            "stale_command_rejections",
+        }
+
+        self.assertEqual(set(snapshot), expected_counters)
+        self.assertTrue(all(value == 0 for value in snapshot.values()))
+        snapshot["unmatched_seq"] = 99
+        self.assertEqual(controller.metrics_snapshot()["unmatched_seq"], 0)
 
     async def test_command_send_records_monotonic_controller_timestamp(self):
         clock = FakeClock(500.25)
@@ -194,6 +227,8 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["status"], "error")
         self.assertEqual(response["error"]["code"], ErrorCode.UNKNOWN_TARGET.value)
+        snapshot = controller.metrics_snapshot()
+        self.assertEqual(snapshot["commands_completed_error"], 1)
 
     async def test_board_unavailable_when_not_registered(self):
         controller = self.make_controller()
@@ -276,6 +311,9 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["error"]["code"], ErrorCode.COMMAND_TIMEOUT.value)
         self.assertIsNone(controller.in_flight_for("motor"))
         self.assertEqual(controller.pending_count(), 0)
+        snapshot = controller.metrics_snapshot()
+        self.assertEqual(snapshot["commands_completed_timeout"], 1)
+        self.assertEqual(snapshot["command_timeouts"], 1)
 
     async def test_queue_residency_timeout_cap(self):
         controller = self.make_controller()
@@ -312,6 +350,9 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["status"], "timeout")
         self.assertIsNone(late)
         self.assertEqual(controller.counters.unmatched_seq, 1)
+        snapshot = controller.metrics_snapshot()
+        self.assertEqual(snapshot["late_board_responses"], 1)
+        self.assertEqual(snapshot["duplicate_board_responses"], 0)
 
     async def test_duplicate_board_response_does_not_double_resolve(self):
         controller = self.make_controller()
@@ -328,6 +369,9 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["status"], "ok")
         self.assertIsNone(duplicate)
         self.assertEqual(controller.counters.unmatched_seq, 1)
+        snapshot = controller.metrics_snapshot()
+        self.assertEqual(snapshot["duplicate_board_responses"], 1)
+        self.assertEqual(snapshot["late_board_responses"], 0)
 
     async def test_board_down_resolves_in_flight_and_queued_commands(self):
         controller = self.make_controller()
@@ -348,6 +392,9 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.fifo_depth_for("motor"), 0)
         self.assertIsNone(controller.in_flight_for("motor"))
         self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.FAULTED)
+        snapshot = controller.metrics_snapshot()
+        self.assertEqual(snapshot["board_disconnects"], 1)
+        self.assertEqual(snapshot["commands_completed_error"], 2)
 
     async def test_estop_blocks_schema_blocked_commands_but_allows_unblocked(self):
         controller = self.make_controller()

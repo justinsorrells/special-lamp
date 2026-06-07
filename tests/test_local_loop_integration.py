@@ -128,7 +128,10 @@ class LocalLoopIntegrationTests(unittest.IsolatedAsyncioTestCase):
             auto_respond=auto_respond,
             close_on_command=close_on_command,
         )
-        await self.board_server.start()
+        try:
+            await self.board_server.start()
+        except PermissionError as exc:
+            raise unittest.SkipTest(f"TCP bind unavailable in this environment: {exc}") from exc
         self.controller = ControllerCore(
             expected_boards={"motor"},
             fifo_depth=fifo_depth,
@@ -146,7 +149,10 @@ class LocalLoopIntegrationTests(unittest.IsolatedAsyncioTestCase):
             socket_path=self.socket_path,
             controller=self.controller,
         )
-        await self.local_server.start()
+        try:
+            await self.local_server.start()
+        except PermissionError as exc:
+            raise unittest.SkipTest(f"Unix socket bind unavailable in this environment: {exc}") from exc
 
     async def connect_local_client(self):
         return await asyncio.open_unix_connection(self.socket_path)

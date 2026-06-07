@@ -10,7 +10,7 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import Any
 
 from interfaces import BoardWriterHandle, send_estop
@@ -41,10 +41,54 @@ from state import (
 
 @dataclass
 class ControllerCounters:
+    obs_dropped: int = 0
     unmatched_seq: int = 0
+    orphaned_response: int = 0
     board_busy_rejections: int = 0
     estop_rejections: int = 0
+    malformed_client_messages: int = 0
+    malformed_board_messages: int = 0
+    client_disconnects: int = 0
+    board_disconnects: int = 0
+    command_timeouts: int = 0
+    controller_shutdown_failures: int = 0
+    redis_write_failures: int = 0
+    local_event_dropped: int = 0
+    critical_event_disconnects: int = 0
+    late_board_responses: int = 0
+    duplicate_board_responses: int = 0
+    commands_completed_ok: int = 0
+    commands_completed_error: int = 0
+    commands_completed_timeout: int = 0
     stale_command_rejections: int = 0
+
+    def increment(self, name: str, amount: int = 1) -> None:
+        if name not in self._counter_names():
+            raise KeyError(f"unknown controller counter {name}")
+        current = getattr(self, name)
+        setattr(self, name, current + amount)
+
+    def record_terminal_response(self, response: dict[str, Any]) -> None:
+        status = response["status"]
+        if status == "ok":
+            self.commands_completed_ok += 1
+            return
+        if status == "error":
+            self.commands_completed_error += 1
+            return
+        if status == "timeout":
+            self.commands_completed_timeout += 1
+            error = response.get("error")
+            if isinstance(error, dict) and error.get("code") == ErrorCode.COMMAND_TIMEOUT.value:
+                self.command_timeouts += 1
+            return
+
+    def snapshot(self) -> dict[str, int]:
+        return {field.name: getattr(self, field.name) for field in fields(self)}
+
+    @classmethod
+    def _counter_names(cls) -> frozenset[str]:
+        return frozenset(field.name for field in fields(cls))
 
 
 @dataclass
@@ -83,6 +127,8 @@ class ControllerCore:
         self.state.boards = {board_id: runtime.state for board_id, runtime in self._boards.items()}
         self._pending: dict[int, PendingCommand] = {}
         self._timeout_tasks: dict[int, asyncio.Task[None]] = {}
+        self._resolved_board_seqs: dict[int, str] = {}
+        self._resolved_board_seq_order: deque[int] = deque(maxlen=4096)
 
     def register_board(
         self,
@@ -143,6 +189,7 @@ class ControllerCore:
                 board_id=board_id,
                 phase="rejected_unknown_target",
             )
+            self._record_terminal_response(response)
             return response
         if runtime.writer is None or runtime.state.conn_state is not BoardConnState.REGISTERED:
             response = build_error_response(
@@ -157,6 +204,7 @@ class ControllerCore:
                 board_id=board_id,
                 phase="board_unavailable",
             )
+            self._record_terminal_response(response)
             return response
 
         reject = self._reject_for_schema_or_estop(runtime, command)
@@ -169,10 +217,11 @@ class ControllerCore:
             )
             phase = "estop_rejected" if reject is ErrorCode.ESTOP_ACTIVE else "rejected"
             self._observe_command_lifecycle(command, response, board_id=board_id, phase=phase)
+            self._record_terminal_response(response)
             return response
 
         if runtime.state.in_flight_board_seq is not None and len(runtime.fifo) >= self.fifo_depth:
-            self.counters.board_busy_rejections += 1
+            self.counters.increment("board_busy_rejections")
             response = build_error_response(
                 seq=client_seq,
                 target=client_target,
@@ -185,6 +234,7 @@ class ControllerCore:
                 board_id=board_id,
                 phase="board_busy",
             )
+            self._record_terminal_response(response)
             return response
 
         loop = asyncio.get_running_loop()
@@ -231,7 +281,12 @@ class ControllerCore:
         board_seq = response["seq"]
         entry = pop_pending(self._pending, board_seq)
         if entry is None:
-            self.counters.unmatched_seq += 1
+            self.counters.increment("unmatched_seq")
+            resolved_status = self._resolved_board_seqs.get(board_seq)
+            if resolved_status == "timeout":
+                self.counters.increment("late_board_responses")
+            elif resolved_status is not None:
+                self.counters.increment("duplicate_board_responses")
             return None
 
         self._cancel_timeout(board_seq)
@@ -270,12 +325,15 @@ class ControllerCore:
             latency_ms=latency_ms,
             board_proc_us=board_proc_us,
         )
+        self._remember_terminal_board_seq(board_seq, client_response["status"])
+        self._record_terminal_response(client_response)
         if not entry.future.done():
             entry.future.set_result(client_response)
         await self._dispatch_next(entry.board_id)
         return client_response
 
     async def board_down(self, board_id: str) -> None:
+        self.counters.increment("board_disconnects")
         runtime = self._boards[board_id]
         runtime.state.conn_state = BoardConnState.FAULTED
         runtime.writer = None
@@ -404,6 +462,36 @@ class ControllerCore:
             return len(self._pending)
         return sum(1 for entry in self._pending.values() if entry.board_id == board_id)
 
+    def metrics_snapshot(self) -> dict[str, int]:
+        snapshot = self.counters.snapshot()
+        obs_counters = getattr(self.observability, "counters", None)
+        if obs_counters is not None:
+            snapshot["obs_dropped"] = getattr(obs_counters, "obs_dropped", snapshot["obs_dropped"])
+            snapshot["redis_write_failures"] = getattr(
+                obs_counters,
+                "redis_write_failures",
+                snapshot["redis_write_failures"],
+            )
+        return dict(snapshot)
+
+    def record_orphaned_response(self) -> None:
+        self.counters.increment("orphaned_response")
+
+    def record_malformed_client_message(self) -> None:
+        self.counters.increment("malformed_client_messages")
+
+    def record_malformed_board_message(self) -> None:
+        self.counters.increment("malformed_board_messages")
+
+    def record_client_disconnect(self) -> None:
+        self.counters.increment("client_disconnects")
+
+    def record_local_event_dropped(self) -> None:
+        self.counters.increment("local_event_dropped")
+
+    def record_critical_event_disconnect(self) -> None:
+        self.counters.increment("critical_event_disconnects")
+
     def fifo_depth_for(self, board_id: str) -> int:
         return len(self._boards[board_id].fifo)
 
@@ -434,7 +522,7 @@ class ControllerCore:
             runtime.state.queue_depth = len(runtime.fifo)
             self._observe_board_state(runtime.state)
             if entry.queue_residency_expired(self._monotonic_time()):
-                self.counters.stale_command_rejections += 1
+                self.counters.increment("stale_command_rejections")
                 self._resolve_entry_error(
                     entry,
                     ErrorCode.COMMAND_TIMEOUT,
@@ -495,7 +583,7 @@ class ControllerCore:
         if blocked_by_estop is None:
             return ErrorCode.UNKNOWN_COMMAND
         if self.state.system.estop_active and blocked_by_estop:
-            self.counters.estop_rejections += 1
+            self.counters.increment("estop_rejections")
             return ErrorCode.ESTOP_ACTIVE
         return None
 
@@ -525,12 +613,26 @@ class ControllerCore:
             board_seq=entry.board_seq,
             phase=phase,
         )
+        self._remember_terminal_board_seq(entry.board_seq, response["status"])
+        self._record_terminal_response(response)
         entry.future.set_result(response)
 
     def _cancel_timeout(self, board_seq: int) -> None:
         task = self._timeout_tasks.pop(board_seq, None)
         if task is not None:
             task.cancel()
+
+    def _record_terminal_response(self, response: dict[str, Any]) -> None:
+        self.counters.record_terminal_response(response)
+
+    def _remember_terminal_board_seq(self, board_seq: int | None, status: str) -> None:
+        if board_seq is None:
+            return
+        if len(self._resolved_board_seq_order) == self._resolved_board_seq_order.maxlen:
+            oldest = self._resolved_board_seq_order[0]
+            self._resolved_board_seqs.pop(oldest, None)
+        self._resolved_board_seq_order.append(board_seq)
+        self._resolved_board_seqs[board_seq] = status
 
     def record_board_telemetry(
         self,

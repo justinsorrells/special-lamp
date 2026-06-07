@@ -108,6 +108,18 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(obs.counters.obs_dropped, 1)
         self.assertEqual([item["fields"]["event_id"] for item in list(obs.queue._queue)], [2, 3])
 
+    async def test_controller_metrics_snapshot_mirrors_observability_counters(self):
+        obs = ObservabilityQueue(maxsize=1)
+        controller = ControllerCore(expected_boards={"motor"}, observability=obs)
+
+        obs.enqueue({"kind": "controller_event", "stream": "controller:events", "fields": {"event_id": 1}})
+        obs.enqueue({"kind": "controller_event", "stream": "controller:events", "fields": {"event_id": 2}})
+        obs.counters.redis_write_failures = 3
+
+        snapshot = controller.metrics_snapshot()
+        self.assertEqual(snapshot["obs_dropped"], 1)
+        self.assertEqual(snapshot["redis_write_failures"], 3)
+
     async def test_redis_write_failure_does_not_fail_command(self):
         obs = ObservabilityQueue(maxsize=20)
         redis = FakeRedis(fail=True)
@@ -125,6 +137,7 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         await worker.stop()
 
         self.assertEqual(response["status"], "ok")
+        self.assertGreater(controller.metrics_snapshot()["redis_write_failures"], 0)
 
     async def test_worker_handles_redis_write_exceptions_without_crashing(self):
         obs = ObservabilityQueue(maxsize=10)
