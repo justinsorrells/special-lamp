@@ -620,7 +620,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Narrow orchestrator git commit scope
+* [x] Task: Narrow orchestrator git commit scope
 
   ## Goal
 
