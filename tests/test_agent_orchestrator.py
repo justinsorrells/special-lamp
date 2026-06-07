@@ -14,8 +14,10 @@ from tools.agent_orchestrator.orchestrate import (
     TIMEOUT_EXIT_CODE,
     Orchestrator,
     extract_added_lines,
+    git_commit,
     last_anchored_match,
     parse_changed_files,
+    parse_commit_scope_paths,
     parse_must_fix,
     parse_per_file_diff,
     parse_simple_toml,
@@ -264,6 +266,66 @@ RM "quoted old.py" -> "quoted new.py"
             "new_file.py",
             "quoted new.py"
         ])
+
+    def test_parse_commit_scope_paths_includes_old_and_new_rename_paths(self):
+        status_output = """ M ordinary_file.py
+?? "space file.py"
+ D deleted_file.py
+R  old_file.py -> new_file.py
+RM "quoted old.py" -> "quoted new.py"
+"""
+        files = parse_commit_scope_paths(status_output)
+        self.assertEqual(files, [
+            "ordinary_file.py",
+            "space file.py",
+            "deleted_file.py",
+            "old_file.py",
+            "new_file.py",
+            "quoted old.py",
+            "quoted new.py",
+        ])
+
+    @patch("tools.agent_orchestrator.orchestrate.run_cmd")
+    def test_git_commit_stages_and_commits_only_reviewed_paths(self, mock_run):
+        mock_run.return_value = (0, "ok", "")
+
+        code, _ = git_commit("agent: scoped", ["approved.py", "space file.py"])
+
+        self.assertEqual(code, 0)
+        self.assertEqual(mock_run.call_args_list[0].args[0], [
+            "git",
+            "add",
+            "--",
+            "approved.py",
+            "space file.py",
+        ])
+        self.assertEqual(mock_run.call_args_list[1].args[0], [
+            "git",
+            "commit",
+            "-m",
+            "agent: scoped",
+            "--",
+            "approved.py",
+            "space file.py",
+        ])
+
+    @patch("tools.agent_orchestrator.orchestrate.run_cmd")
+    def test_git_commit_rejects_empty_reviewed_path_scope(self, mock_run):
+        code, log = git_commit("agent: scoped", [])
+
+        self.assertEqual(code, 1)
+        self.assertIn("No reviewed paths", log)
+        mock_run.assert_not_called()
+
+    @patch("tools.agent_orchestrator.orchestrate.run_cmd")
+    def test_git_commit_stops_when_scoped_add_fails(self, mock_run):
+        mock_run.return_value = (128, "", "pathspec failed")
+
+        code, log = git_commit("agent: scoped", ["missing.py"])
+
+        self.assertEqual(code, 128)
+        self.assertIn("pathspec failed", log)
+        mock_run.assert_called_once_with(["git", "add", "--", "missing.py"])
 
     def test_extract_added_lines(self):
         diff = """--- a/some_file.py
@@ -561,6 +623,66 @@ diff --git a/controller.py b/controller.py
         
         res = self.orchestrator.execute_task(task_file)
         self.assertEqual(res, "AUTO_COMMITTED")
+
+    @patch("tools.agent_orchestrator.orchestrate.run_cmd")
+    def test_auto_commit_uses_reviewed_changed_files_as_git_pathspecs(self, mock_run):
+        def side_effect(args, *arg, **kw):
+            cmd = args[0]
+            if cmd == "codex":
+                return 0, "Codex success", ""
+            if cmd == "git":
+                sub = args[1]
+                if sub == "status":
+                    return 0, ' M approved.py\nR  "old name.py" -> "new name.py"\n', ""
+                if sub == "diff":
+                    return 0, "reviewed diff", ""
+                if sub == "add":
+                    return 0, "", ""
+                if sub == "commit":
+                    return 0, "commit ok", ""
+                if sub == "rev-parse":
+                    return 0, "hash_value", ""
+            if cmd == "claude":
+                return 0, "Final verdict: PASS", ""
+            if cmd in ("agy", "antigravity"):
+                if "--version" in args or "--help" in args:
+                    return 0, "version ok", ""
+                return 0, "Final verdict: PASS", ""
+            return 0, "check passed", ""
+
+        mock_run.side_effect = side_effect
+        self.orchestrator.dry_run = False
+        self.orchestrator.allow_dirty = True
+        self.orchestrator.agent_runs_parent = Path(self.temp_dir)
+        self.orchestrator.config["limits"]["max_task_cycles"] = 1
+
+        task_file = Path(self.temp_dir) / "task.md"
+        task_file.write_text("# Implement options", encoding="utf-8")
+
+        res = self.orchestrator.execute_task(task_file)
+
+        self.assertEqual(res, "AUTO_COMMITTED")
+        git_calls = [call.args[0] for call in mock_run.call_args_list if call.args[0][0] == "git"]
+        self.assertIn(["git", "add", "-N", "."], git_calls)
+        self.assertIn([
+            "git",
+            "add",
+            "--",
+            "approved.py",
+            "old name.py",
+            "new name.py",
+        ], git_calls)
+        self.assertIn([
+            "git",
+            "commit",
+            "-m",
+            "agent: Implement options",
+            "--",
+            "approved.py",
+            "old name.py",
+            "new name.py",
+        ], git_calls)
+        self.assertNotIn(["git", "add", "-A"], git_calls)
 
     @patch("tools.agent_orchestrator.orchestrate.run_cmd")
     def test_verdict_parsing_anti_spoofing(self, mock_run):

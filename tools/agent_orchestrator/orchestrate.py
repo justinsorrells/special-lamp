@@ -338,6 +338,43 @@ def parse_changed_files(status_output: str) -> List[str]:
         files.append(path_part)
     return files
 
+
+def parse_commit_scope_paths(status_output: str) -> List[str]:
+    """Return pathspecs that need staging/committing for reviewed changes.
+
+    ``parse_changed_files`` intentionally reports the final path for review and
+    audit display. The commit stage also needs the old path for renames and
+    deletions so it can stage exactly the reviewed file operations without
+    falling back to ``git add -A``.
+    """
+    paths = []
+    seen = set()
+
+    def add_path(path: str) -> None:
+        path = path.strip().strip('"')
+        if "\\" in path:
+            try:
+                path = path.encode().decode("unicode-escape")
+            except Exception:
+                pass
+        if path and path not in seen:
+            seen.add(path)
+            paths.append(path)
+
+    for line in status_output.splitlines():
+        if not line or len(line) < 3:
+            continue
+
+        path_part = line[2:].strip()
+        if " -> " in path_part:
+            old_path, new_path = path_part.split(" -> ", 1)
+            add_path(old_path)
+            add_path(new_path)
+        else:
+            add_path(path_part)
+
+    return paths
+
 def parse_must_fix(content: str) -> bool:
     content = content.strip()
     if not content:
@@ -413,10 +450,15 @@ def git_switch_branch(branch_name: str) -> bool:
     code, _, _ = run_cmd(["git", "checkout", branch_name])
     return code == 0
 
-def git_commit(message: str) -> Tuple[int, str]:
-    # Stage all additions, deletions, and modifications first
-    run_cmd(["git", "add", "-A"])
-    code, out, err = run_cmd(["git", "commit", "-m", message])
+def git_commit(message: str, paths: List[str]) -> Tuple[int, str]:
+    if not paths:
+        return 1, "No reviewed paths to commit."
+
+    add_code, add_out, add_err = run_cmd(["git", "add", "--", *paths])
+    if add_code != 0:
+        return add_code, add_out + "\n" + add_err
+
+    code, out, err = run_cmd(["git", "commit", "-m", message, "--", *paths])
     return code, out + "\n" + err
 
 def git_diff() -> str:
@@ -924,6 +966,7 @@ class Orchestrator:
             self.log_artifact(f"git_diff_stat_cycle_{cycle}.txt", diff_stat)
 
             changed_files = parse_changed_files(status_after)
+            commit_scope_paths = parse_commit_scope_paths(status_after)
             if not changed_files:
                 print("Codex made no changes.")
                 self.log_report(task_title, agent_branch, "STOP_BACKLOG_EMPTY", "Codex executed but made no modifications.")
@@ -1199,7 +1242,7 @@ class Orchestrator:
         if final_classification == "AUTO_COMMITTED":
             print("All checks passed. Committing changes...")
             commit_msg = f"agent: {task_title}"
-            c_code, c_log = git_commit(commit_msg)
+            c_code, c_log = git_commit(commit_msg, commit_scope_paths)
             if c_code != 0:
                 print(f"Git commit failed with code {c_code}. details: {c_log}")
                 self.log_report(task_title, agent_branch, "STOP_TOOL_ERROR", f"Git commit failed: {c_log}")
