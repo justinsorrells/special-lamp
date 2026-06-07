@@ -27,6 +27,48 @@ class BoardConnState(StrEnum):
 
 
 @dataclass
+class CommandLatencyObservation:
+    board_seq: int
+    latency_ms: float
+    controller_ts: float
+    observed_at: float
+    board_proc_us: float | None = None
+
+
+@dataclass
+class TelemetryRateObservation:
+    sample_count: int = 0
+    last_arrival_at: float | None = None
+    last_interval_ms: float | None = None
+    rate_hz: float | None = None
+    jitter_ms: float | None = None
+
+    def observe(self, arrived_at: float) -> None:
+        self.sample_count += 1
+        if self.last_arrival_at is None:
+            self.last_arrival_at = arrived_at
+            return
+
+        interval_s = arrived_at - self.last_arrival_at
+        self.last_arrival_at = arrived_at
+        if interval_s <= 0:
+            self.last_interval_ms = 0.0
+            self.rate_hz = None
+            self.jitter_ms = None if self.last_interval_ms is None else 0.0
+            return
+
+        interval_ms = interval_s * 1000
+        previous_interval_ms = self.last_interval_ms
+        self.last_interval_ms = interval_ms
+        self.rate_hz = 1.0 / interval_s
+        self.jitter_ms = (
+            None
+            if previous_interval_ms is None
+            else abs(interval_ms - previous_interval_ms)
+        )
+
+
+@dataclass
 class SystemState:
     estop_active: bool = False
     connected_count: int = 0
@@ -48,6 +90,8 @@ class BoardState:
     queue_depth: int = 0
     in_flight_board_seq: int | None = None
     schema: dict[str, Any] | None = None
+    last_command_latency: CommandLatencyObservation | None = None
+    telemetry_rate: TelemetryRateObservation = field(default_factory=TelemetryRateObservation)
 
     def mark_estop_sent(self) -> None:
         self.estop_ack = False
@@ -88,6 +132,12 @@ class BoardStateRecord:
     last_seen: float | None = None
     queue_depth: int = 0
     in_flight_board_seq: int | None = None
+    last_command_latency_ms: float | None = None
+    last_board_proc_us: float | None = None
+    telemetry_rate_hz: float | None = None
+    telemetry_jitter_ms: float | None = None
+    telemetry_interval_ms: float | None = None
+    telemetry_sample_count: int = 0
 
     @classmethod
     def from_board_state(cls, state: BoardState) -> "BoardStateRecord":
@@ -99,6 +149,16 @@ class BoardStateRecord:
             last_seen=state.last_seen,
             queue_depth=state.queue_depth,
             in_flight_board_seq=state.in_flight_board_seq,
+            last_command_latency_ms=(
+                None if state.last_command_latency is None else state.last_command_latency.latency_ms
+            ),
+            last_board_proc_us=(
+                None if state.last_command_latency is None else state.last_command_latency.board_proc_us
+            ),
+            telemetry_rate_hz=state.telemetry_rate.rate_hz,
+            telemetry_jitter_ms=state.telemetry_rate.jitter_ms,
+            telemetry_interval_ms=state.telemetry_rate.last_interval_ms,
+            telemetry_sample_count=state.telemetry_rate.sample_count,
         )
 
     def as_hash(self) -> dict[str, Any]:
@@ -110,6 +170,12 @@ class BoardStateRecord:
             "last_seen": self.last_seen,
             "queue_depth": self.queue_depth,
             "in_flight_board_seq": self.in_flight_board_seq,
+            "last_command_latency_ms": self.last_command_latency_ms,
+            "last_board_proc_us": self.last_board_proc_us,
+            "telemetry_rate_hz": self.telemetry_rate_hz,
+            "telemetry_jitter_ms": self.telemetry_jitter_ms,
+            "telemetry_interval_ms": self.telemetry_interval_ms,
+            "telemetry_sample_count": self.telemetry_sample_count,
         }
 
 
@@ -158,4 +224,3 @@ class ControllerState:
 
     def refresh_connected_count(self) -> None:
         self.system.connected_count = self.connected_count()
-

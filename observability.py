@@ -108,6 +108,8 @@ class ObservabilityQueue:
         error_code: str | None = None,
         command: str | None = None,
         controller_ts: float | None = None,
+        latency_ms: float | None = None,
+        board_proc_us: float | None = None,
     ) -> bool:
         return self.enqueue(
             serialize_command_lifecycle(
@@ -120,6 +122,8 @@ class ObservabilityQueue:
                 error_code=error_code,
                 command=command,
                 controller_ts=controller_ts,
+                latency_ms=latency_ms,
+                board_proc_us=board_proc_us,
             )
         )
 
@@ -244,6 +248,11 @@ def serialize_board_telemetry(message: dict[str, Any]) -> dict[str, Any]:
         "seq": message.get("seq"),
         "timestamp": message.get("timestamp"),
         "telemetry": message.get("telemetry", {}),
+        "controller_received_at": message.get("controller_received_at"),
+        "telemetry_rate_hz": message.get("telemetry_rate_hz"),
+        "telemetry_jitter_ms": message.get("telemetry_jitter_ms"),
+        "telemetry_interval_ms": message.get("telemetry_interval_ms"),
+        "telemetry_sample_count": message.get("telemetry_sample_count"),
     }
     return {
         "kind": "board_telemetry",
@@ -273,6 +282,8 @@ def serialize_command_lifecycle(
     error_code: str | None = None,
     command: str | None = None,
     controller_ts: float | None = None,
+    latency_ms: float | None = None,
+    board_proc_us: float | None = None,
 ) -> dict[str, Any]:
     if status is not None and status not in TERMINAL_STATUSES:
         raise ValueError(f"invalid terminal command status {status!r}")
@@ -288,6 +299,8 @@ def serialize_command_lifecycle(
         "error_code": error_code,
         "command": command,
         "controller_ts": controller_ts,
+        "latency_ms": latency_ms,
+        "board_proc_us": board_proc_us,
     }
     return {"kind": "command_lifecycle", "stream": "command:lifecycle", "fields": fields}
 

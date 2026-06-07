@@ -188,11 +188,7 @@ class BoardTCPConnection:
         if message_type == MessageType.RESPONSE.value:
             await self.controller.handle_board_response(message)
         elif message_type == MessageType.TELEMETRY.value:
-            board = self.controller.state.boards[self.endpoint.board_id]
-            board.last_telemetry = message["telemetry"]
-            board.last_seen = asyncio.get_running_loop().time()
-            self.controller.observe_board_telemetry(message)
-            self.controller.observe_board_state_snapshot(self.endpoint.board_id)
+            self.controller.record_board_telemetry(message)
         elif message_type == MessageType.EVENT.value:
             self.controller.observe_controller_event(message)
             await self._handle_event(message)

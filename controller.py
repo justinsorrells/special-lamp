@@ -10,7 +10,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 import asyncio
-from typing import Any
+from typing import Any, Callable
 
 from interfaces import BoardWriterHandle, send_estop
 from protocol import (
@@ -33,6 +33,7 @@ from state import (
     BoardSeqCounter,
     BoardState,
     ControllerState,
+    CommandLatencyObservation,
     PendingCommand,
 )
 
@@ -65,6 +66,7 @@ class ControllerCore:
         default_execution_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S,
         default_queue_residency_cap_s: float = DEFAULT_QUEUE_RESIDENCY_CAP_S,
         observability: Any | None = None,
+        monotonic_clock: Callable[[], float] | None = None,
     ):
         self.state = ControllerState()
         self.counters = ControllerCounters()
@@ -72,6 +74,7 @@ class ControllerCore:
         self.fifo_depth = fifo_depth
         self.default_execution_timeout_s = default_execution_timeout_s
         self.default_queue_residency_cap_s = default_queue_residency_cap_s
+        self._monotonic_clock = monotonic_clock
         self._boards = {
             board_id: _BoardRuntime(state=BoardState(board_id=board_id))
             for board_id in expected_boards
@@ -192,7 +195,7 @@ class ControllerCore:
             client=client_target,
             future=future,
             command=command,
-            enqueued_at=loop.time(),
+            enqueued_at=self._monotonic_time(),
             queue_residency_cap_s=(
                 self.default_queue_residency_cap_s
                 if queue_residency_cap_s is None
@@ -236,9 +239,20 @@ class ControllerCore:
             runtime.state.in_flight_board_seq = None
             self._observe_board_state(runtime.state)
 
+        observed_at = self._monotonic_time()
         latency_ms = None
         if entry.written_at is not None:
-            latency_ms = (asyncio.get_running_loop().time() - entry.written_at) * 1000
+            latency_ms = (observed_at - entry.written_at) * 1000
+        board_proc_us = self._extract_board_proc_us(response)
+        if latency_ms is not None:
+            runtime.state.last_command_latency = CommandLatencyObservation(
+                board_seq=board_seq,
+                latency_ms=latency_ms,
+                controller_ts=entry.written_at,
+                observed_at=observed_at,
+                board_proc_us=board_proc_us,
+            )
+            self._observe_board_state(runtime.state)
         client_response = build_client_response(
             response,
             client_seq=entry.client_seq,
@@ -252,6 +266,8 @@ class ControllerCore:
             board_id=entry.board_id,
             board_seq=board_seq,
             phase="resolved",
+            latency_ms=latency_ms,
+            board_proc_us=board_proc_us,
         )
         if not entry.future.done():
             entry.future.set_result(client_response)
@@ -412,12 +428,11 @@ class ControllerCore:
         if runtime.state.in_flight_board_seq is not None:
             return
 
-        loop = asyncio.get_running_loop()
         while runtime.fifo:
             entry = runtime.fifo.popleft()
             runtime.state.queue_depth = len(runtime.fifo)
             self._observe_board_state(runtime.state)
-            if entry.queue_residency_expired(loop.time()):
+            if entry.queue_residency_expired(self._monotonic_time()):
                 self.counters.stale_command_rejections += 1
                 self._resolve_entry_error(
                     entry,
@@ -427,14 +442,15 @@ class ControllerCore:
                 )
                 continue
 
+            sent_at = self._monotonic_time()
             board_command = build_board_command(
                 entry.command,
                 board_seq=entry.board_seq,
                 board_id=board_id,
-                controller_ts=loop.time(),
+                controller_ts=sent_at,
             )
             runtime.state.in_flight_board_seq = entry.board_seq
-            entry.written_at = loop.time()
+            entry.written_at = sent_at
             self._pending[entry.board_seq] = entry
             self._observe_board_state(runtime.state)
             self._observe_command_lifecycle_phase(
@@ -515,11 +531,51 @@ class ControllerCore:
         if task is not None:
             task.cancel()
 
+    def record_board_telemetry(
+        self,
+        message: dict[str, Any],
+        *,
+        received_at: float | None = None,
+    ) -> None:
+        validate_message(message)
+        board_id = message["source"]
+        runtime = self._boards.get(board_id)
+        if runtime is None:
+            return
+        if received_at is None:
+            received_at = self._monotonic_time()
+        runtime.state.last_telemetry = message["telemetry"]
+        runtime.state.last_seen = received_at
+        runtime.state.telemetry_rate.observe(received_at)
+        self._observe_board_telemetry(message, runtime.state)
+        self._observe_board_state(runtime.state)
+
     def observe_board_telemetry(self, message: dict[str, Any]) -> None:
+        board_id = message.get("source")
+        if isinstance(board_id, str) and board_id in self._boards:
+            try:
+                self.record_board_telemetry(message)
+            except ProtocolValidationError:
+                return
+            return
+        self._observe_board_telemetry(message, None)
+
+    def _observe_board_telemetry(
+        self,
+        message: dict[str, Any],
+        state: BoardState | None,
+    ) -> None:
         if self.observability is None:
             return
         try:
-            self.observability.enqueue_board_telemetry(message)
+            telemetry_message = dict(message)
+            if state is not None:
+                telemetry_message["controller_received_at"] = state.last_seen
+                telemetry_message["telemetry_rate_hz"] = state.telemetry_rate.rate_hz
+                telemetry_message["telemetry_jitter_ms"] = state.telemetry_rate.jitter_ms
+                telemetry_message["telemetry_interval_ms"] = state.telemetry_rate.last_interval_ms
+                telemetry_message["telemetry_sample_count"] = state.telemetry_rate.sample_count
+            self.observability.enqueue_board_telemetry(telemetry_message)
         except Exception:
             return
 
@@ -558,6 +614,8 @@ class ControllerCore:
         board_id: str,
         phase: str,
         board_seq: int | None = None,
+        latency_ms: float | None = None,
+        board_proc_us: float | None = None,
     ) -> None:
         if self.observability is None:
             return
@@ -574,6 +632,8 @@ class ControllerCore:
                 board_seq=board_seq,
                 error_code=error_code,
                 command=command.get("command"),
+                latency_ms=latency_ms,
+                board_proc_us=board_proc_us,
             )
         except Exception:
             return
@@ -604,3 +664,18 @@ class ControllerCore:
             )
         except Exception:
             return
+
+    def _monotonic_time(self) -> float:
+        if self._monotonic_clock is not None:
+            return self._monotonic_clock()
+        return asyncio.get_running_loop().time()
+
+    def _extract_board_proc_us(self, response: dict[str, Any]) -> float | None:
+        value = response.get("board_proc_us")
+        if value is None and isinstance(response.get("result"), dict):
+            value = response["result"].get("board_proc_us")
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            return None
+        if value < 0:
+            return None
+        return float(value)

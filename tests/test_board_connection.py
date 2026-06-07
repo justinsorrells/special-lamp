@@ -242,6 +242,7 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for(lambda: self.controller.state.boards["motor"].last_telemetry == {"rpm": 100})
         snapshots = [item for item in list(obs.queue._queue) if item["kind"] == "board_state"]
         self.assertTrue(any(item["hash"]["last_telemetry"] == {"rpm": 100} for item in snapshots))
+        self.assertEqual(self.controller.state.boards["motor"].telemetry_rate.sample_count, 1)
 
         await self.server.send_to_latest(
             {
@@ -253,6 +254,37 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         await self.wait_for(lambda: self.controller.state.boards["motor"].estop_ack)
+
+    async def test_board_telemetry_rate_tracking_updates_over_tcp(self):
+        self.start_connection()
+        await self.connection.wait_registered()
+
+        await self.server.send_to_latest(
+            {
+                "type": "telemetry",
+                "seq": 20,
+                "source": "motor",
+                "target": "controller",
+                "telemetry": {"rpm": 100},
+            }
+        )
+        await self.wait_for(lambda: self.controller.state.boards["motor"].telemetry_rate.sample_count == 1)
+        await asyncio.sleep(0.01)
+        await self.server.send_to_latest(
+            {
+                "type": "telemetry",
+                "seq": 21,
+                "source": "motor",
+                "target": "controller",
+                "telemetry": {"rpm": 120},
+            }
+        )
+        await self.wait_for(lambda: self.controller.state.boards["motor"].telemetry_rate.sample_count == 2)
+
+        rate = self.controller.state.boards["motor"].telemetry_rate
+        self.assertIsNotNone(rate.rate_hz)
+        self.assertGreater(rate.rate_hz, 0.0)
+        self.assertIsNotNone(rate.last_interval_ms)
 
 
 if __name__ == "__main__":

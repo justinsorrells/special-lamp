@@ -6,6 +6,17 @@ from protocol import BOARD_MAX_LINE_BYTES, ErrorCode, MessageType, ProtocolValid
 from state import BoardConnState
 
 
+class FakeClock:
+    def __init__(self, now=100.0):
+        self.now = now
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
 def schema_for(board_id="motor"):
     return {
         "type": "schema",
@@ -36,16 +47,21 @@ def client_command(seq=1, target="motor", command="move", args=None):
     }
 
 
-def board_ok_response(board_seq, source="motor"):
-    return {
+def board_ok_response(board_seq, source="motor", *, board_proc_us=None, result=None):
+    if result is None:
+        result = {"accepted": True}
+    response = {
         "type": "response",
         "seq": board_seq,
         "source": source,
         "target": "controller",
         "status": "ok",
-        "result": {"accepted": True},
+        "result": result,
         "error": None,
     }
+    if board_proc_us is not None:
+        response["board_proc_us"] = board_proc_us
+    return response
 
 
 class FakeBoardWriter:
@@ -68,10 +84,10 @@ class FakeBoardWriter:
 
 
 class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
-    def make_controller(self, *, boards=None):
+    def make_controller(self, *, boards=None, monotonic_clock=None):
         if boards is None:
             boards = {"motor"}
-        return ControllerCore(expected_boards=set(boards))
+        return ControllerCore(expected_boards=set(boards), monotonic_clock=monotonic_clock)
 
     def register_motor(self, controller, writer=None):
         if writer is None:
@@ -102,6 +118,145 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["result"]["board_seq"], board_seq)
         self.assertIsNone(controller.in_flight_for("motor"))
         self.assertEqual(controller.pending_count("motor"), 0)
+
+    async def test_command_send_records_monotonic_controller_timestamp(self):
+        clock = FakeClock(500.25)
+        controller = self.make_controller(monotonic_clock=clock)
+        writer = self.register_motor(controller)
+
+        task = asyncio.create_task(controller.route_command(client_command(seq=14)))
+        await self.wait_for_messages(writer, 1)
+        board_command = writer.messages[0]
+
+        self.assertEqual(board_command["controller_ts"], 500.25)
+        self.assertEqual(board_command["controller_ts"], controller._pending[board_command["seq"]].written_at)
+
+        await controller.handle_board_response(board_ok_response(board_command["seq"]))
+        await task
+
+    async def test_command_response_records_monotonic_latency_and_board_proc_us(self):
+        clock = FakeClock(100.0)
+        controller = self.make_controller(monotonic_clock=clock)
+        writer = self.register_motor(controller)
+
+        task = asyncio.create_task(controller.route_command(client_command(seq=15)))
+        await self.wait_for_messages(writer, 1)
+        board_seq = writer.messages[0]["seq"]
+        clock.advance(0.125)
+        client_response = await controller.handle_board_response(
+            board_ok_response(board_seq, board_proc_us=2400)
+        )
+        response = await task
+        observation = controller.state.boards["motor"].last_command_latency
+
+        self.assertEqual(client_response, response)
+        self.assertEqual(response["status"], "ok")
+        self.assertAlmostEqual(response["result"]["latency_ms"], 125.0)
+        self.assertIsNotNone(observation)
+        self.assertEqual(observation.board_seq, board_seq)
+        self.assertAlmostEqual(observation.latency_ms, 125.0)
+        self.assertEqual(observation.controller_ts, 100.0)
+        self.assertEqual(observation.observed_at, 100.125)
+        self.assertEqual(observation.board_proc_us, 2400.0)
+
+    async def test_latency_calculation_does_not_use_wall_clock(self):
+        clock = FakeClock(10.0)
+        controller = self.make_controller(monotonic_clock=clock)
+        writer = self.register_motor(controller)
+
+        task = asyncio.create_task(controller.route_command(client_command(seq=16)))
+        await self.wait_for_messages(writer, 1)
+        board_seq = writer.messages[0]["seq"]
+        import time
+
+        original_time = time.time
+        try:
+            time.time = lambda: -1_000_000.0
+            clock.advance(0.050)
+            response = await controller.handle_board_response(board_ok_response(board_seq))
+        finally:
+            time.time = original_time
+        await task
+
+        self.assertAlmostEqual(response["result"]["latency_ms"], 50.0)
+        self.assertGreaterEqual(response["result"]["latency_ms"], 0.0)
+
+    async def test_missing_and_invalid_board_proc_us_are_accepted(self):
+        for board_response, expected in (
+            (board_ok_response(1), None),
+            (board_ok_response(1, board_proc_us="bad"), None),
+            (board_ok_response(1, board_proc_us=-1), None),
+            (board_ok_response(1, result={"accepted": True, "board_proc_us": 12}), 12.0),
+        ):
+            clock = FakeClock(200.0)
+            controller = self.make_controller(monotonic_clock=clock)
+            writer = self.register_motor(controller)
+            task = asyncio.create_task(controller.route_command(client_command(seq=17)))
+            await self.wait_for_messages(writer, 1)
+            board_response["seq"] = writer.messages[0]["seq"]
+            clock.advance(0.001)
+            response = await controller.handle_board_response(board_response)
+            await task
+
+            self.assertEqual(response["status"], "ok")
+            self.assertEqual(controller.state.boards["motor"].last_command_latency.board_proc_us, expected)
+
+    async def test_telemetry_rate_tracking_handles_first_and_irregular_samples(self):
+        clock = FakeClock(20.0)
+        controller = self.make_controller(monotonic_clock=clock)
+        self.register_motor(controller)
+
+        telemetry = {
+            "type": "telemetry",
+            "seq": 1,
+            "source": "motor",
+            "target": "controller",
+            "telemetry": {"rpm": 100},
+        }
+        controller.observe_board_telemetry(telemetry)
+        rate = controller.state.boards["motor"].telemetry_rate
+        self.assertEqual(rate.sample_count, 1)
+        self.assertIsNone(rate.rate_hz)
+        self.assertIsNone(rate.jitter_ms)
+
+        clock.advance(0.05)
+        controller.observe_board_telemetry({**telemetry, "seq": 2, "telemetry": {"rpm": 110}})
+        self.assertEqual(rate.sample_count, 2)
+        self.assertAlmostEqual(rate.last_interval_ms, 50.0)
+        self.assertAlmostEqual(rate.rate_hz, 20.0)
+        self.assertIsNone(rate.jitter_ms)
+
+        clock.advance(0.08)
+        controller.observe_board_telemetry({**telemetry, "seq": 3, "telemetry": {"rpm": 120}})
+        self.assertEqual(rate.sample_count, 3)
+        self.assertAlmostEqual(rate.last_interval_ms, 80.0)
+        self.assertAlmostEqual(rate.rate_hz, 12.5)
+        self.assertAlmostEqual(rate.jitter_ms, 30.0)
+        self.assertEqual(controller.state.boards["motor"].last_telemetry, {"rpm": 120})
+        self.assertEqual(controller.state.boards["motor"].last_seen, 20.13)
+
+    async def test_telemetry_tracking_tolerates_reconnect_state_changes(self):
+        clock = FakeClock(30.0)
+        controller = self.make_controller(monotonic_clock=clock)
+        writer = self.register_motor(controller)
+        telemetry = {
+            "type": "telemetry",
+            "seq": 1,
+            "source": "motor",
+            "target": "controller",
+            "telemetry": {"rpm": 100},
+        }
+
+        controller.observe_board_telemetry(telemetry)
+        await controller.board_down("motor")
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+        clock.advance(0.05)
+        controller.observe_board_telemetry({**telemetry, "seq": 2})
+
+        rate = controller.state.boards["motor"].telemetry_rate
+        self.assertEqual(rate.sample_count, 2)
+        self.assertAlmostEqual(rate.rate_hz, 20.0)
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
 
     async def test_unknown_board_returns_unknown_target(self):
         controller = self.make_controller()

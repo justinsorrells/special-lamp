@@ -201,6 +201,8 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fields["status"], "ok")
         self.assertIsNone(fields["error_code"])
         self.assertIsInstance(fields["controller_ts"], float)
+        self.assertIsInstance(fields["latency_ms"], float)
+        self.assertIsNone(fields["board_proc_us"])
 
         busy = await controller.route_command(client_command(seq=104, target="missing"))
         lifecycle = [item for item in list(obs.queue._queue) if item["kind"] == "command_lifecycle"][-1]
@@ -244,6 +246,56 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
                 phase="resolved",
                 status="rejected",
             )
+
+    async def test_latency_and_telemetry_observations_are_mirrored_as_read_replica_fields(self):
+        obs = ObservabilityQueue(maxsize=40)
+        controller = ControllerCore(expected_boards={"motor"}, observability=obs)
+        writer = FakeBoardWriter()
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+
+        command_task = asyncio.create_task(controller.route_command(client_command(seq=301)))
+        await self.wait_for(lambda: len(writer.messages) == 1)
+        board_seq = writer.messages[0]["seq"]
+        await controller.handle_board_response(
+            board_ok_response(board_seq, board_proc_us=1200)
+        )
+        await asyncio.wait_for(command_task, timeout=0.5)
+        controller.observe_board_telemetry(
+            {
+                "type": "telemetry",
+                "seq": 1,
+                "source": "motor",
+                "target": "controller",
+                "telemetry": {"rpm": 1000},
+            }
+        )
+        controller.observe_board_telemetry(
+            {
+                "type": "telemetry",
+                "seq": 2,
+                "source": "motor",
+                "target": "controller",
+                "telemetry": {"rpm": 1010},
+            }
+        )
+
+        board_states = [item for item in list(obs.queue._queue) if item["kind"] == "board_state"]
+        latest_state = board_states[-1]["hash"]
+        self.assertIsInstance(latest_state["last_command_latency_ms"], float)
+        self.assertEqual(latest_state["last_board_proc_us"], 1200.0)
+        self.assertEqual(latest_state["telemetry_sample_count"], 2)
+        self.assertIn("telemetry_rate_hz", latest_state)
+        self.assertIn("telemetry_jitter_ms", latest_state)
+
+        telemetry_records = [item for item in list(obs.queue._queue) if item["kind"] == "board_telemetry"]
+        latest_telemetry = telemetry_records[-1]["fields"]
+        self.assertEqual(latest_telemetry["telemetry_sample_count"], 2)
+        self.assertIn("telemetry_rate_hz", latest_telemetry)
+        self.assertIn("telemetry_jitter_ms", latest_telemetry)
+
+        lifecycle = [item for item in list(obs.queue._queue) if item["kind"] == "command_lifecycle"][-1]
+        self.assertIsInstance(lifecycle["fields"]["latency_ms"], float)
+        self.assertEqual(lifecycle["fields"]["board_proc_us"], 1200.0)
 
     async def test_malformed_message_events_can_be_enqueued(self):
         obs = ObservabilityQueue(maxsize=10)
