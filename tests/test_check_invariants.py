@@ -17,8 +17,27 @@ from tools.check_invariants import (
     REPO_ROOT,
     check_client_modules_isolated,
     check_core_command_path_imports,
+    check_error_codes_match_contract,
+    check_no_blocking_calls_in_command_path,
     check_terminal_statuses_frozen,
     run_all_checks,
+)
+
+# A minimal protocol.py whose ErrorCode enum has exactly two codes, paired with an
+# AGENTS.md whose fenced block documents the same two. Tests perturb one side to
+# prove drift is caught.
+_PROTOCOL_TWO_CODES = (
+    "from enum import StrEnum\n\n"
+    "class ErrorCode(StrEnum):\n"
+    '    INVALID_JSON = "INVALID_JSON"\n'
+    '    BOARD_BUSY = "BOARD_BUSY"\n'
+)
+_AGENTS_TWO_CODES = (
+    "# AGENTS.md\n\n"
+    "Error codes:\n\n"
+    "```text\n"
+    "INVALID_JSON  BOARD_BUSY\n"
+    "```\n"
 )
 
 
@@ -150,6 +169,69 @@ class SyntheticViolationTests(unittest.TestCase):
     def test_clean_client_module_passes(self):
         self._write("demos/webapp.py", "import json\nimport socket\n")
         self.assertEqual(check_client_modules_isolated(self.root), [])
+
+    # --- error-code drift --------------------------------------------------
+
+    def test_matching_error_codes_pass(self):
+        self._write("protocol.py", _PROTOCOL_TWO_CODES)
+        self._write("AGENTS.md", _AGENTS_TWO_CODES)
+        self.assertEqual(check_error_codes_match_contract(self.root), [])
+
+    def test_code_missing_from_agents_md_is_flagged(self):
+        self._write(
+            "protocol.py",
+            _PROTOCOL_TWO_CODES + '    UNKNOWN_TARGET = "UNKNOWN_TARGET"\n',
+        )
+        self._write("AGENTS.md", _AGENTS_TWO_CODES)  # still only documents two
+        violations = check_error_codes_match_contract(self.root)
+        self.assertTrue(violations)
+        self.assertIn("UNKNOWN_TARGET", str(violations[0]))
+        self.assertIn("not documented", str(violations[0]))
+
+    def test_code_only_in_agents_md_is_flagged(self):
+        self._write("protocol.py", _PROTOCOL_TWO_CODES)
+        self._write(
+            "AGENTS.md",
+            _AGENTS_TWO_CODES.replace("INVALID_JSON  BOARD_BUSY", "INVALID_JSON  BOARD_BUSY  GHOST_CODE"),
+        )
+        violations = check_error_codes_match_contract(self.root)
+        self.assertTrue(violations)
+        self.assertIn("GHOST_CODE", str(violations[0]))
+        self.assertIn("do not", str(violations[0]))
+
+    def test_lowercase_status_block_is_not_mistaken_for_error_codes(self):
+        # The ok/error/timeout block must not be picked up as the code listing.
+        self._write("protocol.py", _PROTOCOL_TWO_CODES)
+        self._write(
+            "AGENTS.md",
+            _AGENTS_TWO_CODES + "\n```text\nok\nerror\ntimeout\n```\n",
+        )
+        self.assertEqual(check_error_codes_match_contract(self.root), [])
+
+    # --- no blocking calls on the command path -----------------------------
+
+    def test_time_sleep_in_command_path_is_flagged(self):
+        self._write("controller.py", "import time\n\ndef f():\n    time.sleep(1)\n")
+        violations = check_no_blocking_calls_in_command_path(self.root)
+        self.assertTrue(violations)
+        self.assertIn("time.sleep", str(violations[0]))
+
+    def test_sleep_imported_from_time_is_flagged(self):
+        self._write("protocol.py", "from time import sleep\n\ndef f():\n    sleep(1)\n")
+        violations = check_no_blocking_calls_in_command_path(self.root)
+        self.assertTrue(violations)
+        self.assertIn("time.sleep", str(violations[0]))
+
+    def test_blocking_import_in_command_path_is_flagged(self):
+        self._write("board_connection.py", "import requests\n")
+        violations = check_no_blocking_calls_in_command_path(self.root)
+        self.assertTrue(violations)
+        self.assertIn("requests", str(violations[0]))
+
+    def test_time_monotonic_is_allowed(self):
+        # `import time` for a non-blocking clock must not be flagged.
+        self._write("controller.py", "import time\n\ndef now():\n    return time.monotonic()\n")
+        self.assertEqual(check_no_blocking_calls_in_command_path(self.root), [])
 
 
 if __name__ == "__main__":

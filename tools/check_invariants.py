@@ -27,6 +27,7 @@ run_all_checks``) so they can be asserted from the test suite.
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -70,6 +71,19 @@ DEMOS_DIR = "demos"
 CONTROLLER_INTERNAL_MODULES = frozenset(
     {"controller", "board_connection", "interfaces", "local_socket"}
 )
+
+# The human-facing navigation file. Its documented error-code list must stay in
+# lockstep with the `ErrorCode` enum in protocol.py: agents read AGENTS.md to know
+# which codes exist, so silent drift between the two misleads them (and would let
+# a stale doc "authorize" a code that no longer exists, or hide a new one).
+AGENTS_MD = "AGENTS.md"
+
+# Blocking, synchronous libraries that must never appear on an async command-path
+# module. `redis` is handled by FORBIDDEN_CORE_IMPORTS (it is also an architecture
+# violation, not just a blocking one); these are blocking-only offenders. The
+# `time.sleep` *call* is handled separately since `import time` itself is fine
+# (e.g. time.monotonic for clocks) -- only the blocking sleep is forbidden.
+BLOCKING_IMPORT_NAMES = frozenset({"requests"})
 
 
 @dataclass(frozen=True)
@@ -200,6 +214,147 @@ def check_client_modules_isolated(root: Path = REPO_ROOT) -> list[Violation]:
     return violations
 
 
+def _enum_string_values(tree: ast.AST, class_name: str) -> set[str] | None:
+    """Return the str member values of a StrEnum-style class, or None if absent.
+
+    Handles both ``NAME = "value"`` (Assign) and ``NAME: str = "value"``
+    (AnnAssign) member forms, mirroring ``check_terminal_statuses_frozen``.
+    """
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == class_name:
+            values: set[str] = set()
+            for stmt in node.body:
+                if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                    value = stmt.value
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        values.add(value.value)
+            return values
+    return None
+
+
+def _error_codes_in_agents_md(root: Path) -> set[str] | None:
+    """Extract the documented error-code set from AGENTS.md, or None if absent.
+
+    The codes live in exactly one fenced code block: the one whose tokens are all
+    UPPER_SNAKE identifiers (the ``ok/error/timeout`` block is lowercase, the
+    topology/build-order blocks contain paths and prose). This is intentionally
+    structural rather than a whole-file scan so an unrelated UPPER_SNAKE token in
+    prose (e.g. ``SIGTERM``) cannot pollute the comparison.
+    """
+
+    path = root / AGENTS_MD
+    if not path.exists():
+        return None
+    text = path.read_text(encoding="utf-8")
+    codes: set[str] = set()
+    for block in re.findall(r"```[^\n]*\n(.*?)```", text, flags=re.DOTALL):
+        tokens = block.split()
+        if tokens and all(re.fullmatch(r"[A-Z][A-Z0-9_]*", t) for t in tokens) and any(
+            "_" in t for t in tokens
+        ):
+            codes.update(tokens)
+    return codes or None
+
+
+def check_error_codes_match_contract(root: Path = REPO_ROOT) -> list[Violation]:
+    """The error-code list in AGENTS.md must equal protocol.ErrorCode exactly."""
+
+    protocol_path = root / "protocol.py"
+    if not protocol_path.exists():
+        return [Violation("error-code-drift", "protocol.py", "file is missing")]
+
+    defined = _enum_string_values(_parse(protocol_path), "ErrorCode")
+    if defined is None:
+        return [Violation("error-code-drift", "protocol.py", "ErrorCode enum not found")]
+
+    documented = _error_codes_in_agents_md(root)
+    if documented is None:
+        return [Violation("error-code-drift", AGENTS_MD, "no error-code block found")]
+
+    violations: list[Violation] = []
+    missing = defined - documented
+    extra = documented - defined
+    if missing:
+        violations.append(
+            Violation(
+                "error-code-drift",
+                AGENTS_MD,
+                f"error code(s) {sorted(missing)} exist in protocol.ErrorCode but are "
+                "not documented in AGENTS.md",
+            )
+        )
+    if extra:
+        violations.append(
+            Violation(
+                "error-code-drift",
+                AGENTS_MD,
+                f"error code(s) {sorted(extra)} are documented in AGENTS.md but do not "
+                "exist in protocol.ErrorCode",
+            )
+        )
+    return violations
+
+
+def _has_blocking_sleep(tree: ast.AST) -> bool:
+    """True if the module calls ``time.sleep(...)`` or a ``sleep`` imported from time.
+
+    ``import time`` alone is fine (clocks use ``time.monotonic``); only the
+    blocking ``sleep`` call is forbidden on an async path.
+    """
+
+    sleep_imported_from_time = any(
+        isinstance(node, ast.ImportFrom)
+        and node.level == 0
+        and node.module == "time"
+        and any(alias.name == "sleep" for alias in node.names)
+        for node in ast.walk(tree)
+    )
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if (
+            isinstance(func, ast.Attribute)
+            and func.attr == "sleep"
+            and isinstance(func.value, ast.Name)
+            and func.value.id == "time"
+        ):
+            return True
+        if sleep_imported_from_time and isinstance(func, ast.Name) and func.id == "sleep":
+            return True
+    return False
+
+
+def check_no_blocking_calls_in_command_path(root: Path = REPO_ROOT) -> list[Violation]:
+    """Core async modules must not use blocking sleeps or sync I/O libraries."""
+
+    violations: list[Violation] = []
+    for rel in CORE_COMMAND_PATH:
+        path = root / rel
+        if not path.exists():
+            continue
+        tree = _parse(path)
+        for forbidden in sorted(_imported_top_level_modules(tree) & BLOCKING_IMPORT_NAMES):
+            violations.append(
+                Violation(
+                    "no-blocking-calls",
+                    rel,
+                    f"imports blocking library '{forbidden}'; the command path is async "
+                    "and must not perform synchronous I/O",
+                )
+            )
+        if _has_blocking_sleep(tree):
+            violations.append(
+                Violation(
+                    "no-blocking-calls",
+                    rel,
+                    "calls time.sleep(); use 'await asyncio.sleep(...)' on async paths",
+                )
+            )
+    return violations
+
+
 def run_all_checks(root: Path = REPO_ROOT) -> list[Violation]:
     """Run every invariant check and return all violations."""
 
@@ -207,6 +362,8 @@ def run_all_checks(root: Path = REPO_ROOT) -> list[Violation]:
     violations.extend(check_terminal_statuses_frozen(root))
     violations.extend(check_core_command_path_imports(root))
     violations.extend(check_client_modules_isolated(root))
+    violations.extend(check_error_codes_match_contract(root))
+    violations.extend(check_no_blocking_calls_in_command_path(root))
     return violations
 
 

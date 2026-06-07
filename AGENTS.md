@@ -7,7 +7,7 @@
 > contracts, the contracts win and this file should be corrected. Section
 > references like (1.8), (3.12) point at the governing contract decision.
 >
-> The three skills live under `.agents/skills/<name>/SKILL.md` and are committed,
+> The skills live under `.agents/skills/<name>/SKILL.md` and are committed,
 > present files; an agent should never have to chase a missing source of truth.
 
 ## Project summary
@@ -149,7 +149,7 @@ them (contract 5):
 
 ## Skills
 
-Three repo skills encode the rules below. Read the relevant one before working
+Eight repo skills encode the rules below. Read the relevant one before working
 in that area; they defer to the frozen contract and must stay consistent with it.
 
 * `project-networking-invariants` -- topology, the two orthogonal state axes,
@@ -158,6 +158,16 @@ in that area; they defer to the frozen contract and must stay consistent with it
   lock, Redis queue, e-stop gate.
 * `newline-json-protocol` -- framing, line limits, seq vs board_seq, pop-wins,
   malformed-input handling, no new status values.
+* `code-style-and-conventions` -- the repo's actual Python idioms; read for any
+  code change so new code reads like the surrounding code.
+* `testing-async-loops-and-mocks` -- deterministic asyncio tests, stream mocking,
+  injectable clocks; read for anything under `tests/`.
+* `graceful-shutdown-and-lifecycle` -- SIGTERM/SIGINT path, bounded in-flight
+  drain, `CONTROLLER_SHUTDOWN`, idempotent shutdown.
+* `redis-telemetry-and-metrics` -- the bounded drop-oldest observability queue
+  and best-effort Redis writer; read for `observability.py`.
+* `unix-sockets-and-backpressure` -- per-client outbound queues, critical vs
+  non-critical event split, slow-client handling; read for `local_socket.py`.
 
 ## Forbidden changes
 

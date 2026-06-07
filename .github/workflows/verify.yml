@@ -1,0 +1,42 @@
+name: verify
+
+# Runs the documented verification gate (README / CLAUDE.md) on every PR and on
+# pushes to main: the full test suite, the static architecture-invariant checker,
+# lint, and type checks. This is the hard backstop behind the in-session
+# check_invariants hook; the two intentionally run the same commands.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Runtime is 3.14 (see pyproject.toml comments); ruff/mypy target 3.13.
+          python-version: "3.14"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      # Run from the repo root: tests import modules as top-level names.
+      - name: Tests
+        run: python -m pytest
+
+      - name: Architecture invariants
+        run: python tools/check_invariants.py
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Type check
+        run: mypy .
