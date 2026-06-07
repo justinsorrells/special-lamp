@@ -516,7 +516,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Implement controller lifecycle shutdown draining
+* [x] Task: Implement controller lifecycle shutdown draining
 
   ## Goal
 

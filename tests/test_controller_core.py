@@ -417,6 +417,131 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(snapshot["board_disconnects"], 1)
         self.assertEqual(snapshot["commands_completed_error"], 2)
 
+    async def test_shutdown_rejects_new_commands_with_controller_shutdown(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        await controller.shutdown(drain_timeout_s=0.0)
+        response = await controller.route_command(client_command(seq=44))
+
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error"]["code"], ErrorCode.CONTROLLER_SHUTDOWN.value)
+        self.assertEqual(writer.messages, [])
+        self.assertEqual(controller.metrics_snapshot()["commands_completed_error"], 1)
+
+    async def test_shutdown_allows_in_flight_command_to_complete_during_drain(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        command_task = asyncio.create_task(controller.route_command(client_command(seq=45)))
+        await self.wait_for_messages(writer, 1)
+        board_seq = writer.messages[0]["seq"]
+        shutdown_task = asyncio.create_task(controller.shutdown(drain_timeout_s=0.2))
+        await asyncio.sleep(0)
+
+        await controller.handle_board_response(ok_response(board_seq))
+        await asyncio.wait_for(shutdown_task, timeout=0.5)
+        response = await asyncio.wait_for(command_task, timeout=0.2)
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["result"]["board_seq"], board_seq)
+        self.assertEqual(controller.pending_count(), 0)
+        self.assertIsNone(controller.in_flight_for("motor"))
+        self.assertTrue(writer.closed)
+        self.assertEqual(controller.metrics_snapshot()["commands_completed_ok"], 1)
+
+    async def test_shutdown_quiesces_dispatch_and_fails_queued_command_after_drain(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        first = asyncio.create_task(controller.route_command(client_command(seq=46)))
+        await self.wait_for_messages(writer, 1)
+        second = asyncio.create_task(controller.route_command(client_command(seq=47)))
+        await asyncio.sleep(0)
+        shutdown_task = asyncio.create_task(controller.shutdown(drain_timeout_s=0.2))
+        await async_wait_for(lambda: controller._shutting_down, timeout=0.2)
+
+        await controller.handle_board_response(ok_response(writer.messages[0]["seq"]))
+        await asyncio.wait_for(shutdown_task, timeout=0.5)
+        first_response = await asyncio.wait_for(first, timeout=0.2)
+        second_response = await asyncio.wait_for(second, timeout=0.2)
+
+        self.assertEqual(first_response["status"], "ok")
+        self.assertEqual(second_response["status"], "error")
+        self.assertEqual(second_response["error"]["code"], ErrorCode.CONTROLLER_SHUTDOWN.value)
+        self.assertEqual(len(writer.messages), 1)
+        self.assertEqual(controller.pending_count(), 0)
+        self.assertEqual(controller.fifo_depth_for("motor"), 0)
+
+    async def test_shutdown_fails_unresolved_in_flight_and_queued_commands(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+
+        first = asyncio.create_task(controller.route_command(client_command(seq=48)))
+        await self.wait_for_messages(writer, 1)
+        second = asyncio.create_task(controller.route_command(client_command(seq=49)))
+        await asyncio.sleep(0)
+        board_seq = writer.messages[0]["seq"]
+
+        await controller.shutdown(drain_timeout_s=0.0)
+        first_response = await asyncio.wait_for(first, timeout=0.2)
+        second_response = await asyncio.wait_for(second, timeout=0.2)
+
+        self.assertEqual(first_response["status"], "error")
+        self.assertEqual(first_response["error"]["code"], ErrorCode.CONTROLLER_SHUTDOWN.value)
+        self.assertEqual(second_response["status"], "error")
+        self.assertEqual(second_response["error"]["code"], ErrorCode.CONTROLLER_SHUTDOWN.value)
+        self.assertEqual(controller.pending_count(), 0)
+        self.assertEqual(controller.fifo_depth_for("motor"), 0)
+        self.assertIsNone(controller.in_flight_for("motor"))
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.DISCONNECTED)
+        self.assertTrue(writer.closed)
+        self.assertEqual(writer.close_count, 1)
+
+        late = await controller.handle_board_response(ok_response(board_seq))
+        self.assertIsNone(late)
+        snapshot = controller.metrics_snapshot()
+        self.assertEqual(snapshot["unmatched_seq"], 1)
+        self.assertEqual(snapshot["duplicate_board_responses"], 1)
+        self.assertEqual(snapshot["commands_completed_error"], 2)
+
+    async def test_shutdown_during_board_write_keeps_pending_until_failure(self):
+        controller = self.make_controller()
+        writer = FakeBoardWriter()
+        writer.use_gate = True
+        self.register_motor(controller, writer)
+
+        command_task = asyncio.create_task(controller.route_command(client_command(seq=51)))
+        await writer.started.wait()
+        shutdown_task = asyncio.create_task(controller.shutdown(drain_timeout_s=0.0))
+        await async_wait_for(lambda: controller._shutting_down, timeout=0.2)
+
+        writer.allow_finish.set()
+        await asyncio.wait_for(shutdown_task, timeout=0.5)
+        response = await asyncio.wait_for(command_task, timeout=0.2)
+
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error"]["code"], ErrorCode.CONTROLLER_SHUTDOWN.value)
+        self.assertEqual(controller.pending_count(), 0)
+        self.assertIsNone(controller.in_flight_for("motor"))
+        self.assertTrue(writer.closed)
+
+    async def test_shutdown_is_idempotent(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+        task = asyncio.create_task(controller.route_command(client_command(seq=50)))
+        await self.wait_for_messages(writer, 1)
+
+        await asyncio.gather(
+            controller.shutdown(drain_timeout_s=0.0),
+            controller.shutdown(drain_timeout_s=0.0),
+        )
+        response = await asyncio.wait_for(task, timeout=0.2)
+
+        self.assertEqual(response["error"]["code"], ErrorCode.CONTROLLER_SHUTDOWN.value)
+        self.assertEqual(writer.close_count, 1)
+        self.assertEqual(controller.pending_count(), 0)
+
     async def test_estop_blocks_schema_blocked_commands_but_allows_unblocked(self):
         controller = self.make_controller()
         writer = self.register_motor(controller)
