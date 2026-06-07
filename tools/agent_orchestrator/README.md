@@ -103,7 +103,7 @@ If a command is not found or fails to run, or if the requested model cannot be v
 ## Stop Conditions & Safety Gates
 
 The orchestrator will immediately halt and require manual intervention if:
-1. **Tests / Checks fail**: `pytest` or `compileall` (which compiles only modified Python files to prevent slow walks) fails. Logs of failed checks are cleanly structured and fed back to Codex.
+1. **Tests / Checks fail**: `pytest`, `compileall` (which compiles only modified Python files to prevent slow walks), or the static architecture invariants checker fails. Logs of failed checks are cleanly structured and fed back to Codex.
 2. **Review fails**:
    - Claude's verdict is `FAIL` or Antigravity's audit verdict is `FAIL`. Verdicts are matched robustly regardless of Markdown emphasis (e.g. `**Final verdict:** PASS`).
    - Claude Code CLI lists items in the `"Must fix before commit:"` section. Negation expressions like `"None"`, `"n/a"`, or `"no issues"` are ignored to avoid false positives.
@@ -112,7 +112,6 @@ The orchestrator will immediately halt and require manual intervention if:
    - Codex introduces a terminal status other than `ok`, `error`, or `timeout` (validated via a robust regex covering Python assignments, annotations, and key-values scoped to each file's added lines).
    - Codex attempts to route commands through Redis (by importing `redis`/`aioredis` or calling pubsub/publish/xadd methods inside core controller files, checked using robust file basenames).
    - Codex attempts to establish direct board TCP connections (`open_connection`) outside `board_connection.py` (checked by scanning each file's individual diff chunk).
-   - Codex conflates `seq` and `board_seq` or bypasses the per-board writer lock.
 4. **Security / Risk triggers**:
    - Newly created files are staged with `git add -N .` immediately after Codex executes, ensuring they are subject to all safety scans and review audits.
    - Diff size exceeds configured limits.
@@ -144,9 +143,11 @@ Every execution cycle saves detailed diagnostics under `.agent_runs/<timestamp>/
 Every execution ends with one of the following terminal statuses logged in `final_report.md`:
 
 - `AUTO_COMMITTED`
+- `DRY_RUN_OK`
 - `STOP_BACKLOG_EMPTY`
 - `STOP_TESTS_FAILED`
 - `STOP_COMPILE_FAILED`
+- `STOP_INVARIANTS_FAILED`
 - `STOP_LINT_FAILED`
 - `STOP_TYPECHECK_FAILED`
 - `STOP_CLAUDE_REVIEW_FAILED`
