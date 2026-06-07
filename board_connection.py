@@ -9,7 +9,9 @@ Unix socket server, Redis, GUI integration, firmware, or webapp behavior.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
+import random
+from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 from controller import ControllerCore
@@ -26,12 +28,52 @@ from protocol import (
 )
 from state import BoardConnState
 
+DEFAULT_RECONNECT_BACKOFF_BASE_S = 0.5
+DEFAULT_RECONNECT_BACKOFF_FACTOR = 2.0
+DEFAULT_RECONNECT_BACKOFF_CAP_S = 5.0
+
 
 @dataclass(frozen=True)
 class BoardEndpoint:
     board_id: str
     host: str
     port: int
+
+
+@dataclass
+class ReconnectBackoff:
+    """Exponential reconnect backoff with full jitter."""
+
+    base_delay_s: float = DEFAULT_RECONNECT_BACKOFF_BASE_S
+    factor: float = DEFAULT_RECONNECT_BACKOFF_FACTOR
+    cap_delay_s: float = DEFAULT_RECONNECT_BACKOFF_CAP_S
+    random_fraction: Callable[[], float] = random.random
+    _current_ceiling_s: float = field(init=False)
+
+    def __post_init__(self) -> None:
+        if self.base_delay_s <= 0:
+            raise ValueError("reconnect backoff base delay must be positive")
+        if self.factor <= 1:
+            raise ValueError("reconnect backoff factor must be greater than 1")
+        if self.cap_delay_s < self.base_delay_s:
+            raise ValueError("reconnect backoff cap must be greater than or equal to base delay")
+        self._current_ceiling_s = self.base_delay_s
+
+    @property
+    def current_ceiling_s(self) -> float:
+        return self._current_ceiling_s
+
+    def next_delay_s(self) -> float:
+        fraction = self.random_fraction()
+        if fraction < 0 or fraction > 1:
+            raise ValueError("reconnect jitter random_fraction must return a value from 0 to 1")
+
+        delay_s = self._current_ceiling_s * fraction
+        self._current_ceiling_s = min(self.cap_delay_s, self._current_ceiling_s * self.factor)
+        return delay_s
+
+    def reset(self) -> None:
+        self._current_ceiling_s = self.base_delay_s
 
 
 @dataclass(frozen=True)
@@ -81,13 +123,24 @@ class BoardTCPConnection:
         endpoint: BoardEndpoint,
         controller: ControllerCore,
         *,
-        reconnect_delay_s: float = 0.05,
+        reconnect_delay_s: float | None = None,
+        reconnect_backoff: ReconnectBackoff | None = None,
         registration_timeout_s: float = 2.0,
         heartbeat: HeartbeatConfig | None = None,
     ):
         self.endpoint = endpoint
         self.controller = controller
-        self.reconnect_delay_s = reconnect_delay_s
+        if reconnect_backoff is not None and reconnect_delay_s is not None:
+            raise ValueError("pass either reconnect_delay_s or reconnect_backoff, not both")
+        self.reconnect_backoff = (
+            reconnect_backoff
+            if reconnect_backoff is not None
+            else ReconnectBackoff(
+                base_delay_s=(
+                    DEFAULT_RECONNECT_BACKOFF_BASE_S if reconnect_delay_s is None else reconnect_delay_s
+                )
+            )
+        )
         self.registration_timeout_s = registration_timeout_s
         self.heartbeat = HeartbeatConfig() if heartbeat is None else heartbeat
         self._stop = asyncio.Event()
@@ -119,7 +172,14 @@ class BoardTCPConnection:
         while not self._stop.is_set():
             await self._connect_and_read_once()
             if not self._stop.is_set():
-                await asyncio.sleep(self.reconnect_delay_s)
+                await self._wait_before_reconnect()
+
+    async def _wait_before_reconnect(self) -> None:
+        delay_s = self.reconnect_backoff.next_delay_s()
+        try:
+            await asyncio.wait_for(self._stop.wait(), timeout=delay_s)
+        except TimeoutError:
+            pass
 
     async def _connect_and_read_once(self) -> None:
         self._registered.clear()
@@ -155,6 +215,7 @@ class BoardTCPConnection:
                 )
             except (ProtocolValidationError, ValueError):
                 return
+            self.reconnect_backoff.reset()
             self._registered.set()
             if self.controller.state.system.estop_active:
                 await self.controller.send_estop_to_board(self.endpoint.board_id)

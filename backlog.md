@@ -661,7 +661,7 @@ General rules for every task:
      audit (canonical source: ~/contract_FINAL_backlog.md), ratified by Codex + Antigravity.
      Frozen contract `docs/contracts/V1_Networking_Decisions.md` is unchanged. -->
 
-* [ ] Task: Implement exponential reconnect backoff with full jitter (contract 1.4)
+* [x] Task: Implement exponential reconnect backoff with full jitter (contract 1.4)
 
   ## Goal
 
