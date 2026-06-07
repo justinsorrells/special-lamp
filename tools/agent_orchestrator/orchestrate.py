@@ -16,17 +16,63 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 
 # Fallback TOML parser to maintain python 3.9 compatibility
+# Fallback TOML parser to maintain python 3.9 compatibility
 def parse_simple_toml(file_path: Path) -> dict:
     config = {}
     current_section = None
+    section_name = None
     if not file_path.exists():
         return config
     
+    in_array = False
+    array_lines = []
+    array_key = None
+    array_section = None
+
     with open(file_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
+                
+            if in_array:
+                array_lines.append(line)
+                if "]" in line:
+                    val_str = " ".join(array_lines)
+                    inner = val_str[val_str.find("[")+1:val_str.find("]")].strip()
+                    val = []
+                    if inner:
+                        parts = [p.strip() for p in inner.split(",")]
+                        for p in parts:
+                            if not p:
+                                continue
+                            if p.startswith('"') and p.endswith('"'):
+                                val.append(p[1:-1])
+                            elif p.startswith("'") and p.endswith("'"):
+                                val.append(p[1:-1])
+                            elif p.lower() == "true":
+                                val.append(True)
+                            elif p.lower() == "false":
+                                val.append(False)
+                            elif p.isdigit():
+                                val.append(int(p))
+                            else:
+                                val.append(p)
+                    
+                    if array_section:
+                        sec_parts = array_section.split(".")
+                        curr_sec = config
+                        for part in sec_parts:
+                            curr_sec = curr_sec[part]
+                        curr_sec[array_key] = val
+                    else:
+                        config[array_key] = val
+                    in_array = False
+                    array_lines = []
+                    array_key = None
+                    array_section = None
+                continue
+
             section_match = re.match(r"^\[([\w\.\-_]+)\]$", line)
             if section_match:
                 section_name = section_match.group(1)
@@ -44,8 +90,35 @@ def parse_simple_toml(file_path: Path) -> dict:
                 if " #" in val_str:
                     val_str = val_str.split(" #")[0].strip()
                 
+                if val_str.startswith("[") and not val_str.endswith("]"):
+                    in_array = True
+                    array_lines = [val_str]
+                    array_key = key
+                    array_section = section_name
+                    continue
+                
                 # Parse value
-                if val_str.startswith('"') and val_str.endswith('"'):
+                if val_str.startswith('[') and val_str.endswith(']'):
+                    inner = val_str[1:-1].strip()
+                    val = []
+                    if inner:
+                        parts = [p.strip() for p in inner.split(",")]
+                        for p in parts:
+                            if not p:
+                                continue
+                            if p.startswith('"') and p.endswith('"'):
+                                val.append(p[1:-1])
+                            elif p.startswith("'") and p.endswith("'"):
+                                val.append(p[1:-1])
+                            elif p.lower() == "true":
+                                val.append(True)
+                            elif p.lower() == "false":
+                                val.append(False)
+                            elif p.isdigit():
+                                val.append(int(p))
+                            else:
+                                val.append(p)
+                elif val_str.startswith('"') and val_str.endswith('"'):
                     val = val_str[1:-1]
                 elif val_str.startswith("'") and val_str.endswith("'"):
                     val = val_str[1:-1]
@@ -59,7 +132,6 @@ def parse_simple_toml(file_path: Path) -> dict:
                     val = val_str
                 
                 if current_section:
-                    # Traversal for nested section
                     sec_parts = section_name.split(".")
                     curr_sec = config
                     for part in sec_parts:
@@ -99,12 +171,31 @@ def load_config(config_path: Optional[Path] = None) -> dict:
             "pytest": True,
             "compileall": True,
             "ruff": "auto",
-            "mypy": "auto"
+            "mypy": "auto",
+            "invariants": True
         },
         "limits": {
             "max_changed_files": 30,
             "max_diff_lines": 2500,
             "max_task_cycles": 5
+        },
+        "review": {
+            "allow_claude_override_antigravity": True,
+            "antigravity_hard_stop_categories": [
+                "contract_violation",
+                "safety_or_estop_issue",
+                "command_path_violation",
+                "redis_boundary_violation",
+                "seq_board_seq_confusion",
+                "writer_serialization_issue",
+                "race_condition",
+                "data_loss",
+                "unbounded_queue_or_blocking_async",
+                "test_failure",
+                "invariant_failure",
+                "frozen_contract_modified",
+                "security_or_secret_exposure"
+            ]
         }
     }
 
@@ -461,6 +552,24 @@ class Orchestrator:
         else:
             self.log_artifact("mypy.txt", "mypy was disabled.")
 
+        # 5. Invariants checker
+        if checks_cfg.get("invariants", True):
+            print("Running invariants check...")
+            py_bin = ".venv/bin/python" if Path(".venv/bin/python").exists() else "python3"
+            code, out, err = run_cmd([py_bin, "tools/check_invariants.py"])
+            results["invariants"] = out + "\n" + err
+            self.log_artifact("check_invariants.txt", results["invariants"])
+            if code != 0:
+                passed_all = False
+                failed_checks.append("invariants")
+                if not fail_reason:
+                    fail_reason = "STOP_INVARIANTS_FAILED"
+                print("invariants check failed!")
+            else:
+                print("invariants check passed.")
+        else:
+            self.log_artifact("check_invariants.txt", "invariants check was disabled.")
+
         return passed_all, results, fail_reason, failed_checks
 
     def check_forbidden_patterns(self, diff: str, changed_files: List[str], task_desc: str) -> Optional[str]:
@@ -631,7 +740,7 @@ class Orchestrator:
         # Build Codex prompt
         codex_template_path = Path("tools/agent_orchestrator/prompts/codex_implement.md")
         codex_template = codex_template_path.read_text(encoding="utf-8") if codex_template_path.exists() else "{TASK_CONTENT}"
-        codex_prompt = codex_template.replace("{TASK_CONTENT}", task_content)
+        codex_prompt = codex_template.replace("{TASK_CONTENT}", task_content).replace("{CONTEXT_TEXT}", context_text)
 
         # 4. Dry Run Mode Check
         if self.dry_run:
@@ -641,8 +750,8 @@ class Orchestrator:
             print(f"Claude cmd: {self.config['agents']['claude']['command']} -p --model {self.config['agents']['claude']['model']}")
             print("No changes will be applied.")
             self.log_artifact("codex_prompt.md", codex_prompt)
-            self.log_report(task_title, agent_branch, "AUTO_COMMITTED", "Dry run completed.", dry_run=True)
-            return "AUTO_COMMITTED"
+            self.log_report(task_title, agent_branch, "DRY_RUN_OK", "Dry run completed.", dry_run=True)
+            return "DRY_RUN_OK"
 
         self.final_artifacts = {
             "codex_prompt.md": "",
@@ -655,12 +764,15 @@ class Orchestrator:
             "compileall.txt": "",
             "ruff.txt": "",
             "mypy.txt": "",
+            "check_invariants.txt": "",
             "claude_prompt.md": "",
             "claude_stdout.txt": "",
             "claude_stderr.txt": "",
             "claude_review.md": "",
             "antigravity_prompt.md": "",
-            "antigravity_audit.md": ""
+            "antigravity_audit.md": "",
+            "claude_adjudication_prompt.md": "",
+            "claude_adjudication.md": ""
         }
 
         limits = self.config.get("limits", {})
@@ -756,7 +868,7 @@ class Orchestrator:
             # 9. Claude review
             claude_template_path = Path("tools/agent_orchestrator/prompts/claude_review.md")
             claude_template = claude_template_path.read_text(encoding="utf-8") if claude_template_path.exists() else "{GIT_DIFF}"
-            claude_prompt = claude_template.replace("{GIT_DIFF}", diff)
+            claude_prompt = claude_template.replace("{GIT_DIFF}", diff).replace("{CONTEXT_TEXT}", context_text)
             self.final_artifacts["claude_prompt.md"] = claude_prompt
             self.log_artifact(f"claude_prompt_cycle_{cycle}.md", claude_prompt)
 
@@ -778,14 +890,14 @@ class Orchestrator:
                 self.log_report(task_title, agent_branch, "STOP_CLAUDE_REVIEW_FAILED", f"Claude CLI execution failed: {cl_err}")
                 return "STOP_CLAUDE_REVIEW_FAILED"
 
-            # Parse Claude verdict (B4)
-            verdict_match = re.search(r"(?i)Final verdict\b[\s*:*_]*(PASS|FAIL)\b", cl_out)
-            if not verdict_match:
+            # Parse Claude verdict (B4) safely (anchored multiline regex, taking the last match)
+            claude_verdict_matches = list(re.finditer(r"^Final verdict:\s*(PASS|FAIL)\s*$", cl_out, re.MULTILINE | re.IGNORECASE))
+            if not claude_verdict_matches:
                 print("Claude review response was missing a valid final verdict.")
                 self.log_report(task_title, agent_branch, "STOP_CLAUDE_REVIEW_FAILED", "Could not parse PASS/FAIL verdict from Claude output.")
                 return "STOP_CLAUDE_REVIEW_FAILED"
             
-            claude_verdict = verdict_match.group(1).upper()
+            claude_verdict = claude_verdict_matches[-1].group(1).upper()
             print(f"Claude Review Verdict (cycle {cycle}): {claude_verdict}")
             
             # Check if there are items under "Must fix before commit:"
@@ -811,7 +923,8 @@ class Orchestrator:
                 .replace("{GIT_STATUS}", status_after) \
                 .replace("{GIT_DIFF_STAT}", diff_stat) \
                 .replace("{GIT_DIFF}", diff) \
-                .replace("{PYTEST_LOGS}", check_logs.get("pytest", "No logs"))
+                .replace("{PYTEST_LOGS}", check_logs.get("pytest", "No logs")) \
+                .replace("{CONTEXT_TEXT}", context_text)
             
             self.final_artifacts["antigravity_prompt.md"] = antigravity_prompt
             self.log_artifact(f"antigravity_prompt_cycle_{cycle}.md", antigravity_prompt)
@@ -831,14 +944,14 @@ class Orchestrator:
                 self.log_report(task_title, agent_branch, "STOP_ANTIGRAVITY_AUDIT_FAILED", f"Antigravity audit command failed: {ant_err}")
                 return "STOP_ANTIGRAVITY_AUDIT_FAILED"
 
-            # Parse Antigravity verdict (B4)
-            anti_verdict_match = re.search(r"(?i)Final verdict\b[\s*:*_]*(PASS|FAIL)\b", ant_out)
-            if not anti_verdict_match:
+            # Parse Antigravity verdict safely (anchored multiline regex, taking the last match)
+            anti_verdict_matches = list(re.finditer(r"^Final verdict:\s*(PASS|FAIL)\s*$", ant_out, re.MULTILINE | re.IGNORECASE))
+            if not anti_verdict_matches:
                 print("Antigravity audit response was missing a valid final verdict.")
                 self.log_report(task_title, agent_branch, "STOP_ANTIGRAVITY_AUDIT_FAILED", "Could not parse PASS/FAIL verdict from Antigravity audit.")
                 return "STOP_ANTIGRAVITY_AUDIT_FAILED"
             
-            anti_verdict = anti_verdict_match.group(1).upper()
+            anti_verdict = anti_verdict_matches[-1].group(1).upper()
             print(f"Antigravity Audit Verdict: {anti_verdict}")
             
             if anti_verdict == "PASS":
@@ -846,60 +959,134 @@ class Orchestrator:
                 final_classification = "AUTO_COMMITTED"
                 break
             else:
-                # Antigravity raised concerns. Pass to Claude to evaluate validity.
-                print("Antigravity audit raised concerns. Passing findings to Claude to evaluate validity...")
+                # Antigravity returned FAIL
+                allow_override = self.config.get("review", {}).get("allow_claude_override_antigravity", True)
+                if not allow_override:
+                    print("Antigravity audit failed, and Claude override is disabled. Stopping for human review.")
+                    self.log_report(task_title, agent_branch, "STOP_HUMAN_REVIEW_REQUIRED", f"Antigravity audit returned FAIL, and override is disabled. Audit output:\n{ant_out}")
+                    return "STOP_HUMAN_REVIEW_REQUIRED"
                 
-                claude_evaluation_prompt = f"""# Claude Audit Concern Evaluation
-
-You are Claude CLI, the adversarial reviewer.
-Antigravity has performed a final audit of the changes and raised the following concerns:
-
-{ant_out}
-
-Please evaluate these concerns against the project contracts and invariants (in AGENTS.md, docs/contracts/, etc.).
-If you agree that these concerns are valid and require changes before committing, output:
-Final verdict: FAIL
-And list the exact instructions for Codex to fix them in the "Must fix before commit:" section.
-
-If you find no validity in these concerns and believe the code is safe to commit as-is, output:
-Final verdict: PASS
-"""
-                self.log_artifact(f"claude_evaluation_prompt_cycle_{cycle}.md", claude_evaluation_prompt)
+                # Compute orchestrator facts
+                tests_passed = "pytest" not in failed_checks and "compileall" not in failed_checks
+                invariants_passed = "invariants" not in failed_checks
+                frozen_contracts_changed = any(f.startswith("docs/contracts/") for f in changed_files)
                 
-                print("Invoking Claude CLI to evaluate Antigravity concerns...")
-                cl_eval_code, cl_eval_out, cl_eval_err = run_cmd(claude_cmd, input_str=claude_evaluation_prompt)
+                command_path_files = {
+                    "controller.py",
+                    "board_connection.py",
+                    "protocol.py",
+                    "state.py",
+                    "interfaces.py",
+                    "local_socket.py"
+                }
+                command_path_files_changed = any(Path(f).name in command_path_files for f in changed_files)
                 
-                self.log_artifact(f"claude_eval_stdout_cycle_{cycle}.txt", cl_eval_out)
-                self.log_artifact(f"claude_eval_stderr_cycle_{cycle}.txt", cl_eval_err)
-                self.log_artifact(f"claude_eval_review_cycle_{cycle}.md", cl_eval_out)
+                safety_keywords = ["estop", "estop_ack", "blocked_by_estop", "safe state", "safety"]
+                safety_or_estop_path_changed = any(kw in diff for kw in safety_keywords)
+                
+                seq_keywords = ["board_seq", "PendingCommand", "pending", "pop_pending", "seq"]
+                seq_or_board_seq_logic_changed = any(kw in diff for kw in seq_keywords)
+                
+                writer_keywords = ["SerializedBoardWriter", "writer lock", "send_estop", "write_message", "writer.drain", "writer.write"]
+                writer_serialization_logic_changed = any(kw in diff for kw in writer_keywords)
+                
+                security_or_secret_stop_triggered = (forbidden_stop is not None)
+                
+                # Check deterministic hard-stop conditions:
+                has_hard_stop_fact = False
+                hard_stop_reasons = []
+                
+                if not tests_passed:
+                    has_hard_stop_fact = True
+                    hard_stop_reasons.append("Tests did not pass")
+                if not invariants_passed:
+                    has_hard_stop_fact = True
+                    hard_stop_reasons.append("Invariants check did not pass")
+                if frozen_contracts_changed:
+                    has_hard_stop_fact = True
+                    hard_stop_reasons.append("Frozen contracts were modified")
+                if security_or_secret_stop_triggered:
+                    has_hard_stop_fact = True
+                    hard_stop_reasons.append("Security or secret stop was triggered")
+                if command_path_files_changed:
+                    has_hard_stop_fact = True
+                    hard_stop_reasons.append("Command path files were modified")
+                if safety_or_estop_path_changed:
+                    has_hard_stop_fact = True
+                    hard_stop_reasons.append("Safety or e-stop logic was affected")
+                if seq_or_board_seq_logic_changed:
+                    has_hard_stop_fact = True
+                    hard_stop_reasons.append("Sequence number logic was affected")
+                if writer_serialization_logic_changed:
+                    has_hard_stop_fact = True
+                    hard_stop_reasons.append("Writer serialization logic was affected")
+                
+                if has_hard_stop_fact:
+                    reasons_str = "; ".join(hard_stop_reasons)
+                    print(f"Antigravity failed and hard-stop facts were met: {reasons_str}. Stopping for human review.")
+                    self.log_report(task_title, agent_branch, "STOP_HUMAN_REVIEW_REQUIRED", f"Antigravity audit returned FAIL and hard-stop facts were met: {reasons_str}. Audit output:\n{ant_out}")
+                    return "STOP_HUMAN_REVIEW_REQUIRED"
+                
+                # Ask Claude for structured adjudication
+                print("Antigravity raised concerns. Passing findings to Claude for structured adjudication...")
+                
+                claude_adjudication_template_path = Path("tools/agent_orchestrator/prompts/claude_adjudication.md")
+                if claude_adjudication_template_path.exists():
+                    claude_adjudication_template = claude_adjudication_template_path.read_text(encoding="utf-8")
+                else:
+                    claude_adjudication_template = "Adjudicate Antigravity concerns:\n{ANTIGRAVITY_AUDIT_TEXT}\nContext:\n{CONTEXT_TEXT}"
+                
+                claude_adjudication_prompt = claude_adjudication_template \
+                    .replace("{ANTIGRAVITY_AUDIT_TEXT}", ant_out) \
+                    .replace("{CONTEXT_TEXT}", context_text)
+                
+                self.final_artifacts["claude_adjudication_prompt.md"] = claude_adjudication_prompt
+                self.log_artifact(f"claude_adjudication_prompt_cycle_{cycle}.md", claude_adjudication_prompt)
+                
+                print("Invoking Claude CLI to adjudicate Antigravity concerns...")
+                cl_eval_code, cl_eval_out, cl_eval_err = run_cmd(claude_cmd, input_str=claude_adjudication_prompt)
+                
+                self.final_artifacts["claude_adjudication.md"] = cl_eval_out
+                self.log_artifact(f"claude_adjudication_stdout_cycle_{cycle}.txt", cl_eval_out)
+                self.log_artifact(f"claude_adjudication_stderr_cycle_{cycle}.txt", cl_eval_err)
+                self.log_artifact(f"claude_adjudication_cycle_{cycle}.md", cl_eval_out)
                 
                 if cl_eval_code != 0:
-                    print(f"Claude CLI exited with code {cl_eval_code} during evaluation.")
-                    self.log_report(task_title, agent_branch, "STOP_CLAUDE_REVIEW_FAILED", f"Claude CLI evaluation failed: {cl_eval_err}")
+                    print(f"Claude CLI exited with code {cl_eval_code} during adjudication.")
+                    self.log_report(task_title, agent_branch, "STOP_CLAUDE_REVIEW_FAILED", f"Claude CLI adjudication failed: {cl_eval_err}")
                     return "STOP_CLAUDE_REVIEW_FAILED"
                 
-                eval_verdict_match = re.search(r"(?i)Final verdict\b[\s*:*_]*(PASS|FAIL)\b", cl_eval_out)
-                if not eval_verdict_match:
-                    print("Claude evaluation response was missing a valid final verdict.")
-                    self.log_report(task_title, agent_branch, "STOP_CLAUDE_REVIEW_FAILED", "Could not parse PASS/FAIL verdict from Claude evaluation.")
-                    return "STOP_CLAUDE_REVIEW_FAILED"
+                # Parse adjudication verdict safely
+                adj_matches = list(re.finditer(r"^ANTIGRAVITY_ADJUDICATION:\s*(OVERRIDE_ALLOWED|HARD_STOP)\s*$", cl_eval_out, re.MULTILINE | re.IGNORECASE))
+                if not adj_matches:
+                    print("Claude adjudication response was missing a valid ANTIGRAVITY_ADJUDICATION line.")
+                    self.log_report(task_title, agent_branch, "STOP_HUMAN_REVIEW_REQUIRED", "Claude adjudication output could not be parsed safely.")
+                    return "STOP_HUMAN_REVIEW_REQUIRED"
                 
-                eval_verdict = eval_verdict_match.group(1).upper()
-                print(f"Claude Evaluation of Antigravity Concerns Verdict: {eval_verdict}")
+                adjudication_verdict = adj_matches[-1].group(1).upper()
+                print(f"Claude Adjudication Verdict: {adjudication_verdict}")
                 
-                if eval_verdict == "FAIL":
-                    if cycle < max_cycles:
-                        print(f"Claude validated Antigravity's concerns. Re-prompting Codex for cycle {cycle+1}.")
-                        feedback_to_codex = f"Claude validated Antigravity's concerns. Please address the following issues:\n{cl_eval_out}"
-                        continue
-                    else:
-                        self.log_report(task_title, agent_branch, "STOP_ANTIGRAVITY_AUDIT_FAILED", "Claude validated Antigravity concerns but max cycles reached.")
-                        return "STOP_ANTIGRAVITY_AUDIT_FAILED"
-                else:
-                    # Claude rejected Antigravity concerns
-                    print("Claude found no validity in Antigravity's concerns. Overriding concerns and committing.")
-                    final_classification = "AUTO_COMMITTED"
-                    break
+                conf_matches = list(re.finditer(r"^confidence:\s*(low|medium|high)\s*$", cl_eval_out, re.MULTILINE | re.IGNORECASE))
+                if not conf_matches:
+                    print("Claude adjudication response was missing a valid confidence level.")
+                    self.log_report(task_title, agent_branch, "STOP_HUMAN_REVIEW_REQUIRED", "Claude confidence level is missing from adjudication.")
+                    return "STOP_HUMAN_REVIEW_REQUIRED"
+                
+                confidence = conf_matches[-1].group(1).lower()
+                if confidence == "low":
+                    print("Claude adjudication confidence is low. Stopping for human review.")
+                    self.log_report(task_title, agent_branch, "STOP_HUMAN_REVIEW_REQUIRED", "Claude confidence level is low.")
+                    return "STOP_HUMAN_REVIEW_REQUIRED"
+                
+                if adjudication_verdict == "HARD_STOP":
+                    print("Claude adjudication returned HARD_STOP. Stopping for human review.")
+                    self.log_report(task_title, agent_branch, "STOP_HUMAN_REVIEW_REQUIRED", "Claude adjudication returned HARD_STOP.")
+                    return "STOP_HUMAN_REVIEW_REQUIRED"
+                
+                # Override allowed
+                print("Claude found Antigravity's concerns safe to override. Overriding and committing.")
+                final_classification = "AUTO_COMMITTED"
+                break
         else:
             print("Reached maximum execution cycles without matching PASS verdicts.")
             self.log_report(task_title, agent_branch, "STOP_TOOL_ERROR", "Max cycles reached without matching PASS verdicts.")
@@ -952,8 +1139,18 @@ Final verdict: PASS
         if not self.config.get("checks", {}).get("pytest", True):
             pytest_status = "SKIPPED"
         
+        invariants_status = "PASS" if not classification.startswith("STOP_INVARIANTS") else "FAIL"
+        if not self.config.get("checks", {}).get("invariants", True):
+            invariants_status = "SKIPPED"
+        
         claude_verdict = "PASS" if not classification.startswith("STOP_CLAUDE") else "FAIL"
         anti_verdict = "PASS" if not classification.startswith("STOP_ANTIGRAVITY") else "FAIL"
+        
+        auto_commit_decision = "ALLOWED" if classification == "AUTO_COMMITTED" else "STOPPED"
+        if dry_run:
+            auto_commit_decision = "DRY_RUN (NOT COMMITTED)"
+            
+        stop_reason_val = classification if classification not in ("AUTO_COMMITTED", "DRY_RUN_OK") else "None (Completed)"
         
         report_content = f"""# Final Report: {task_summary}
 
@@ -972,12 +1169,13 @@ Final verdict: PASS
 
 ## Execution Summary
 - **Codex Command Used**: `{codex_cfg.get('command')} {codex_cfg.get('mode')} --model {codex_cfg.get('model')}`
-- **Auto-Commit Decision**: {"ALLOWED" if classification == "AUTO_COMMITTED" else "STOPPED"}
-- **Stop Reason**: {classification if classification != "AUTO_COMMITTED" else "None (Completed)"}
+- **Auto-Commit Decision**: {auto_commit_decision}
+- **Stop Reason**: {stop_reason_val}
 - **Commit Hash**: {commit_hash if commit_hash else "None"}
 
 ## Verification Outcomes
 - **Pytest Output**: {pytest_status}
+- **Invariants Output**: {invariants_status}
 - **Claude Verdict**: {claude_verdict}
 - **Antigravity Audit Verdict**: {anti_verdict}
 
@@ -1020,10 +1218,10 @@ def main():
             sys.exit(1)
         
         classification = orchestrator.execute_task(task_path)
-        if classification != "AUTO_COMMITTED":
-            sys.exit(1)
-        else:
+        if classification in ("AUTO_COMMITTED", "DRY_RUN_OK"):
             sys.exit(0)
+        else:
+            sys.exit(1)
 
     elif args.backlog:
         backlog_path = Path(args.backlog)
@@ -1047,10 +1245,27 @@ def main():
         match = matches[0]
         task_line_text = match.group(1).strip()
         
+        # Extract task details until next top-level checkbox or heading
+        task_start = match.start()
+        remaining_text = backlog_content[task_start:]
+        lines = remaining_text.splitlines()
+        
+        task_lines = [lines[0]]
+        for line in lines[1:]:
+            is_checkbox = re.match(r"^\s*[-\*]\s*\[\s*[xX ]\s*\]", line)
+            is_top_level_heading = re.match(r"^#\s+", line)
+            is_hr = re.match(r"^---", line)
+            if is_checkbox or is_top_level_heading or is_hr:
+                break
+            task_lines.append(line)
+            
+        task_lines[0] = f"# {task_line_text}"
+        full_scratch_content = "\n".join(task_lines)
+        
         # Create a temporary task file for execution
         temp_task_file = Path("tools/agent_orchestrator/scratch_task.md")
         temp_task_file.parent.mkdir(parents=True, exist_ok=True)
-        temp_task_file.write_text(f"# {task_line_text}\n\nSelected from backlog: {args.backlog}", encoding="utf-8")
+        temp_task_file.write_text(full_scratch_content, encoding="utf-8")
         
         try:
             classification = orchestrator.execute_task(temp_task_file)
@@ -1072,6 +1287,9 @@ def main():
                 
                 backlog_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
                 print(f"Task '{task_line_text}' completed and checked off in backlog.")
+                sys.exit(0)
+            elif classification == "DRY_RUN_OK":
+                print("Dry run completed successfully in backlog mode. Not committing.")
                 sys.exit(0)
             else:
                 print(f"Stopped execution on backlog task. Classification: {classification}")

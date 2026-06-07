@@ -16,6 +16,9 @@ Verify that:
 7. **Test Results**: Check the pytest logs to ensure all tests passed.
 8. **Diff Size**: Verify that the diff size is within bounds (not too large for reliable review).
 
+## Loaded Contracts and Context
+{CONTEXT_TEXT}
+
 ## Details of Change
 
 ### Task Scope

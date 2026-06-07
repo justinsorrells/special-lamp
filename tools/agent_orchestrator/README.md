@@ -15,7 +15,7 @@ The **Agent Orchestrator** is a repo-local utility designed to automate the deve
 - **Claude CLI (Opus 4.8)**: Adversarial reviewer that verifies the git diff against the invariants.
 - **Human**: Exception handler, resolver of ambiguity, and final merge authority.
 
-No human gating is required for successful, passing tasks. If all checks, reviews, and audits pass, the orchestrator commits the changes to an agent branch. The operator is only interrupted when a verification step fails or high-risk modifications are detected.
+No human gating is required for successful, passing tasks where all audits pass. If all checks, reviews, and audits pass, the orchestrator commits the changes to an agent branch. However, if Antigravity audit fails, the bounded override policy will route hard-stop and ambiguous cases to human review. The operator is also interrupted when a verification step fails or high-risk modifications are detected.
 
 ---
 
@@ -112,7 +112,6 @@ The orchestrator will immediately halt and require manual intervention if:
    - Codex introduces a terminal status other than `ok`, `error`, or `timeout` (validated via a robust regex covering Python assignments, annotations, and key-values scoped to each file's added lines).
    - Codex attempts to route commands through Redis (by importing `redis`/`aioredis` or calling pubsub/publish/xadd methods inside core controller files, checked using robust file basenames).
    - Codex attempts to establish direct board TCP connections (`open_connection`) outside `board_connection.py` (checked by scanning each file's individual diff chunk).
-   - Codex conflates `seq` and `board_seq` or bypasses the per-board writer lock.
 4. **Security / Risk triggers**:
    - Newly created files are staged with `git add -N .` immediately after Codex executes, ensuring they are subject to all safety scans and review audits.
    - Diff size exceeds configured limits.
@@ -132,9 +131,10 @@ Every execution cycle saves detailed diagnostics under `.agent_runs/<timestamp>/
 - `codex_stdout.txt` / `codex_stderr.txt` — Capture of Codex execution.
 - `git_status_before.txt` / `git_status_after.txt` — Short status logs.
 - `git_diff_stat.txt` / `git_diff.patch` — Git diff outputs.
-- `pytest.txt` / `compileall.txt` / `ruff.txt` / `mypy.txt` — Execution logs of test/lint tools.
+- `pytest.txt` / `compileall.txt` / `ruff.txt` / `mypy.txt` / `check_invariants.txt` — Execution logs of test, lint, typecheck, and invariant tools.
 - `claude_prompt.md` / `claude_review.md` — Verification details.
 - `antigravity_audit.md` — Independent audit evaluation.
+- `claude_adjudication_prompt.md` / `claude_adjudication.md` — Adjudication request and response details when override is evaluated.
 - `final_report.md` — Summary report including classifications, verdicts, and next steps.
 
 ---
@@ -144,16 +144,35 @@ Every execution cycle saves detailed diagnostics under `.agent_runs/<timestamp>/
 Every execution ends with one of the following terminal statuses logged in `final_report.md`:
 
 - `AUTO_COMMITTED`
+- `DRY_RUN_OK`
 - `STOP_BACKLOG_EMPTY`
 - `STOP_TESTS_FAILED`
 - `STOP_COMPILE_FAILED`
+- `STOP_INVARIANTS_FAILED`
 - `STOP_LINT_FAILED`
 - `STOP_TYPECHECK_FAILED`
 - `STOP_CLAUDE_REVIEW_FAILED`
 - `STOP_ANTIGRAVITY_AUDIT_FAILED`
+- `STOP_HUMAN_REVIEW_REQUIRED`
 - `STOP_CONTRACT_CHANGE`
 - `STOP_ARCHITECTURE_RISK`
 - `STOP_HIGH_RISK_CHANGE`
 - `STOP_MODEL_UNVERIFIED`
 - `STOP_DIRTY_WORKTREE`
 - `STOP_TOOL_ERROR`
+
+---
+
+## Bounded Antigravity Override Policy & Human Gating
+
+While Claude remains the strongest adjudication model, Antigravity functions as an independent audit. If Antigravity fails (verdict `FAIL`), the orchestrator enforces deterministic hard stops. Claude override is **not** a blanket escape hatch:
+1. If tests, typecheck, or invariants fail, auto-override is blocked.
+2. If command-path files, safety/e-stop path files, sequence number logic (detected via diff-keyword heuristics for "board_seq", "PendingCommand", "pending", "pop_pending", "seq"), or writer serialization logic (detected via diff-keyword heuristics for "SerializedBoardWriter", "writer lock", "send_estop", "write_message", "writer.drain", "writer.write") are modified, the orchestrator halts immediately with `STOP_HUMAN_REVIEW_REQUIRED`.
+3. Claude may only adjudicate and override `FAIL` on safe non-critical logic changes under structured adjudication.
+
+## Self-Modification Limitations & Maintenance Mode
+
+Modifications to `tools/agent_orchestrator/*`, `tools/check_invariants.py`, or tests under `tests/` are allowed for orchestrator-maintenance and system-hardening tasks, but they require close reviewer attention because they bypass certain code paths and self-modify the pipeline gates.
+
+When changing the static invariant checker `tools/check_invariants.py`, you must add or run tests verifying that the checker continues to catch representative architecture and design-invariant violations.
+

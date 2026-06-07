@@ -24,8 +24,27 @@ pytest = true
 compileall = true
 ruff = "auto"
 mypy = "auto"
+invariants = true
 
 [limits]
 max_changed_files = 30
 max_diff_lines = 2500
 max_task_cycles = 5
+
+[review]
+allow_claude_override_antigravity = true
+antigravity_hard_stop_categories = [
+  "contract_violation",
+  "safety_or_estop_issue",
+  "command_path_violation",
+  "redis_boundary_violation",
+  "seq_board_seq_confusion",
+  "writer_serialization_issue",
+  "race_condition",
+  "data_loss",
+  "unbounded_queue_or_blocking_async",
+  "test_failure",
+  "invariant_failure",
+  "frozen_contract_modified",
+  "security_or_secret_exposure"
+]
