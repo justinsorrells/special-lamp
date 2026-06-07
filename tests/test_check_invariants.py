@@ -178,6 +178,11 @@ class SyntheticViolationTests(unittest.TestCase):
         self.assertEqual(check_error_codes_match_contract(self.root), [])
 
     def test_code_missing_from_agents_md_is_flagged(self):
+        """
+        Verifies that an error code present in protocol.py but missing from AGENTS.md is reported as a violation.
+        
+        Writes a protocol with an extra `UNKNOWN_TARGET` ErrorCode and a matching AGENTS.md that lacks it, then asserts the invariant checker returns at least one violation mentioning `UNKNOWN_TARGET` and that it is "not documented".
+        """
         self._write(
             "protocol.py",
             _PROTOCOL_TWO_CODES + '    UNKNOWN_TARGET = "UNKNOWN_TARGET"\n',

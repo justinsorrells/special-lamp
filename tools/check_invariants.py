@@ -189,10 +189,13 @@ def check_core_command_path_imports(root: Path = REPO_ROOT) -> list[Violation]:
 
 
 def check_client_modules_isolated(root: Path = REPO_ROOT) -> list[Violation]:
-    """Every module under demos/ must stay isolated from controller internals.
-
-    Discovers demo modules dynamically (all ``demos/**/*.py``) so a newly added
-    client/dashboard/mock script is covered without editing this file.
+    """
+    Ensure demo modules under the demos/ directory do not import controller-internal modules.
+    
+    Scans all Python files under demos/ (demos/**/*.py) and records a Violation for each demo file that imports any top-level module listed in CONTROLLER_INTERNAL_MODULES.
+    
+    Returns:
+        list[Violation]: Violations found, one per demo file and forbidden import; empty if none or if demos/ is absent.
     """
 
     violations: list[Violation] = []
@@ -215,10 +218,13 @@ def check_client_modules_isolated(root: Path = REPO_ROOT) -> list[Violation]:
 
 
 def _enum_string_values(tree: ast.AST, class_name: str) -> set[str] | None:
-    """Return the str member values of a StrEnum-style class, or None if absent.
-
-    Handles both ``NAME = "value"`` (Assign) and ``NAME: str = "value"``
-    (AnnAssign) member forms, mirroring ``check_terminal_statuses_frozen``.
+    """
+    Collect string constant member values from a class named `class_name` in the given AST.
+    
+    Handles both simple assignments (`NAME = "value"`) and annotated assignments (`NAME: str = "value"`). 
+    
+    Returns:
+        values (set[str] | None): A set of the class's string member values if the class exists in the AST, or `None` if the class is not found.
     """
 
     for node in ast.walk(tree):
@@ -234,13 +240,16 @@ def _enum_string_values(tree: ast.AST, class_name: str) -> set[str] | None:
 
 
 def _error_codes_in_agents_md(root: Path) -> set[str] | None:
-    """Extract the documented error-code set from AGENTS.md, or None if absent.
-
-    The codes live in exactly one fenced code block: the one whose tokens are all
-    UPPER_SNAKE identifiers (the ``ok/error/timeout`` block is lowercase, the
-    topology/build-order blocks contain paths and prose). This is intentionally
-    structural rather than a whole-file scan so an unrelated UPPER_SNAKE token in
-    prose (e.g. ``SIGTERM``) cannot pollute the comparison.
+    """
+    Extract documented error-code identifiers from AGENTS.md.
+    
+    Searches fenced code blocks and returns the set of tokens from the block whose tokens are all uppercase identifiers (letters, digits, underscores), with at least one token containing an underscore—this selects the specific UPPER_SNAKE error-code block and avoids unrelated tokens in prose.
+    
+    Parameters:
+        root (Path): Repository root directory containing AGENTS.md.
+    
+    Returns:
+        set[str] | None: Set of documented error-code names if a suitable fenced block is found; `None` if AGENTS.md is missing or no matching block is found.
     """
 
     path = root / AGENTS_MD
@@ -258,7 +267,12 @@ def _error_codes_in_agents_md(root: Path) -> set[str] | None:
 
 
 def check_error_codes_match_contract(root: Path = REPO_ROOT) -> list[Violation]:
-    """The error-code list in AGENTS.md must equal protocol.ErrorCode exactly."""
+    """
+    Check that the set of error codes defined in protocol.ErrorCode matches the error codes documented in AGENTS.md.
+    
+    Returns:
+        list[Violation]: A list of violations describing mismatches (codes present in the enum but not documented, or documented but not present in the enum) or missing source files/sections; empty if the documented and defined sets are identical.
+    """
 
     protocol_path = root / "protocol.py"
     if not protocol_path.exists():
@@ -297,10 +311,13 @@ def check_error_codes_match_contract(root: Path = REPO_ROOT) -> list[Violation]:
 
 
 def _has_blocking_sleep(tree: ast.AST) -> bool:
-    """True if the module calls ``time.sleep(...)`` or a ``sleep`` imported from time.
-
-    ``import time`` alone is fine (clocks use ``time.monotonic``); only the
-    blocking ``sleep`` call is forbidden on an async path.
+    """
+    Detect whether the AST contains blocking sleep calls from the time module.
+    
+    Checks for calls to `time.sleep(...)` or `sleep(...)` when `sleep` is imported from `time`; a plain `import time` without calling `sleep` is not considered a blocking call.
+    
+    Returns:
+        true if a blocking sleep call is present, false otherwise.
     """
 
     sleep_imported_from_time = any(
@@ -327,7 +344,19 @@ def _has_blocking_sleep(tree: ast.AST) -> bool:
 
 
 def check_no_blocking_calls_in_command_path(root: Path = REPO_ROOT) -> list[Violation]:
-    """Core async modules must not use blocking sleeps or sync I/O libraries."""
+    """
+    Check core async command-path modules for forbidden blocking operations.
+    
+    Scans each file listed in CORE_COMMAND_PATH under `root` and reports violations when a module:
+    - imports a top-level blocking library listed in BLOCKING_IMPORT_NAMES (e.g., `requests`), or
+    - invokes a blocking sleep (`time.sleep(...)` or `sleep(...)` imported from `time`).
+    
+    Parameters:
+        root (Path): Repository root to resolve command-path module files from.
+    
+    Returns:
+        list[Violation]: A list of `no-blocking-calls` violations describing the file and reason for each detected blocking usage.
+    """
 
     violations: list[Violation] = []
     for rel in CORE_COMMAND_PATH:
@@ -356,7 +385,15 @@ def check_no_blocking_calls_in_command_path(root: Path = REPO_ROOT) -> list[Viol
 
 
 def run_all_checks(root: Path = REPO_ROOT) -> list[Violation]:
-    """Run every invariant check and return all violations."""
+    """
+    Run all repository architecture invariant checks and collect any violations.
+    
+    Parameters:
+        root (Path): Filesystem path to the repository root to scan; defaults to the repository root constant.
+    
+    Returns:
+        violations (list[Violation]): A list of discovered Violation instances (empty if no violations).
+    """
 
     violations: list[Violation] = []
     violations.extend(check_terminal_statuses_frozen(root))
