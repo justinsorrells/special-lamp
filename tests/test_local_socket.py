@@ -99,6 +99,7 @@ class LocalSocketBackpressureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await client.send_event(event_message(3), critical=False))
 
         self.assertEqual(self.server.client_event_dropped, 1)
+        self.assertEqual(self.controller.metrics_snapshot()["local_event_dropped"], 1)
         self.assertEqual([message["event_id"] for message in queued_payloads(client)], [2, 3])
         self.assertTrue(client.is_connected)
 
@@ -134,6 +135,7 @@ class LocalSocketBackpressureTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(client.connected)
         self.assertTrue(client.writer.closed)
         self.assertEqual(self.server.critical_event_disconnects, 1)
+        self.assertEqual(self.controller.metrics_snapshot()["critical_event_disconnects"], 1)
 
     async def test_broadcast_classifies_state_events_noncritical_by_default(self):
         client = LocalClientConnection(
@@ -207,6 +209,19 @@ class LocalSocketBackpressureTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(receiving.is_connected)
         self.assertEqual([message["event_id"] for message in queued_payloads(receiving)], [2])
         self.assertEqual(self.server.critical_event_disconnects, 1)
+
+    async def test_response_to_disconnected_client_increments_orphan_counter(self):
+        writer = FakeLocalWriter()
+        writer.closed = True
+        client = LocalClientConnection(
+            reader=None,
+            writer=writer,
+            outbound_maxsize=1,
+        )
+
+        await self.server._route_and_reply(client, client_command(target="missing"))
+
+        self.assertEqual(self.controller.metrics_snapshot()["orphaned_response"], 1)
 
 
 class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
@@ -287,6 +302,7 @@ class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
             event = [item for item in list(obs.queue._queue) if item["kind"] == "controller_event"][-1]
             self.assertEqual(event["fields"]["event"], "malformed_client_message")
             self.assertEqual(event["fields"]["details"]["error_code"], ErrorCode.INVALID_JSON.value)
+            self.assertEqual(self.controller.metrics_snapshot()["malformed_client_messages"], 1)
         finally:
             writer.close()
             await writer.wait_closed()

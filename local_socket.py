@@ -242,6 +242,7 @@ class LocalUnixSocketServer:
                 except asyncio.IncompleteReadError:
                     return
                 except asyncio.LimitOverrunError:
+                    self.controller.record_malformed_client_message()
                     self.controller.observe_controller_event(
                         {
                             "type": MessageType.EVENT.value,
@@ -261,6 +262,7 @@ class LocalUnixSocketServer:
                     return
                 message, error_response = self._parse_client_line(line)
                 if error_response is not None:
+                    self.controller.record_malformed_client_message()
                     self.controller.observe_controller_event(
                         {
                             "type": MessageType.EVENT.value,
@@ -289,6 +291,7 @@ class LocalUnixSocketServer:
                 asyncio.create_task(self._route_and_reply(client, message))
         finally:
             self.clients.discard(client)
+            self.controller.record_client_disconnect()
             await client.close()
 
     async def _route_and_reply(
@@ -297,7 +300,9 @@ class LocalUnixSocketServer:
         command: dict[str, Any],
     ) -> None:
         response = await self.controller.route_command(command)
-        await client.send_response(response)
+        delivered = await client.send_response(response)
+        if not delivered:
+            self.controller.record_orphaned_response()
 
     async def _reset_estop_and_reply(
         self,
@@ -308,13 +313,17 @@ class LocalUnixSocketServer:
             reset_message,
             condition_cleared=self.estop_reset_condition_cleared(),
         )
-        await client.send_response(response)
+        delivered = await client.send_response(response)
+        if not delivered:
+            self.controller.record_orphaned_response()
 
     def _increment_client_event_dropped(self) -> None:
         self.client_event_dropped += 1
+        self.controller.record_local_event_dropped()
 
     def _increment_critical_event_disconnects(self) -> None:
         self.critical_event_disconnects += 1
+        self.controller.record_critical_event_disconnect()
 
     def _is_critical_event(self, event: dict[str, Any]) -> bool:
         event_name = event.get("event")
