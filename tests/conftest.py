@@ -24,18 +24,31 @@ def encode(message: dict[str, Any]) -> bytes:
     return (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
 
 
-def ok_response(board_seq: int, board_id: str = "motor") -> dict[str, Any]:
-    """Build a minimal terminal `ok` board response for the given board_seq."""
-
-    return {
+def ok_response(
+    board_seq: int,
+    board_id: str = "motor",
+    *,
+    board_proc_us: float | None = None,
+    result: dict[str, Any] | None = None,
+    controller_ts: float | None = None,
+) -> dict[str, Any]:
+    """Build a terminal `ok` board response for the given board_seq."""
+    if result is None:
+        result = {"accepted": True}
+    response = {
         "type": "response",
         "seq": board_seq,
         "source": board_id,
         "target": "controller",
         "status": "ok",
-        "result": {"accepted": True},
+        "result": result,
         "error": None,
     }
+    if board_proc_us is not None:
+        response["board_proc_us"] = board_proc_us
+    if controller_ts is not None:
+        response["controller_ts"] = controller_ts
+    return response
 
 
 async def async_wait_for(
@@ -119,3 +132,75 @@ class FakeStreamWriter:
                 if line:
                     decoded.append(json.loads(line))
         return decoded
+
+
+class FakeClock:
+    """Mock clock callable that can be advanced manually for deterministic timing tests."""
+
+    def __init__(self, now: float = 100.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        """Advance the mock clock time instantly."""
+        self.now += seconds
+
+
+def schema_for(board_id: str = "motor") -> dict[str, Any]:
+    """Build a standard mock schema message for a board connect event."""
+    return {
+        "type": "schema",
+        "seq": 1,
+        "source": board_id,
+        "target": "controller",
+        "protocol_version": "1",
+        "schema": {
+            "commands": {
+                "move": {"args": {"rpm": "int"}, "blocked_by_estop": True},
+                "status": {"args": {}, "blocked_by_estop": False},
+                "legacy_motion": {"args": {}},
+            },
+            "telemetry": {},
+            "state": {},
+        },
+    }
+
+
+def client_command(
+    seq: int = 1,
+    target: str = "motor",
+    command: str = "move",
+    args: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build a standard mock command message from a client."""
+    return {
+        "type": "command",
+        "seq": seq,
+        "source": "gui",
+        "target": target,
+        "command": command,
+        "args": {} if args is None else args,
+    }
+
+
+class FakeBoardWriter:
+    """Mock writer handle that records messages sent to the board."""
+
+    def __init__(self, *, delay: float = 0.0) -> None:
+        self.lock = asyncio.Lock()
+        self.messages: list[dict[str, Any]] = []
+        self.started = asyncio.Event()
+        self.allow_finish = asyncio.Event()
+        self.delay = delay
+        self.use_gate = False
+
+    async def write_message(self, message: dict[str, Any]) -> None:
+        async with self.lock:
+            self.started.set()
+            self.messages.append(message)
+            if self.use_gate:
+                await self.allow_finish.wait()
+            if self.delay:
+                await asyncio.sleep(self.delay)

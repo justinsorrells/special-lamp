@@ -4,83 +4,14 @@ import unittest
 from controller import ControllerCore
 from protocol import BOARD_MAX_LINE_BYTES, ErrorCode, MessageType, ProtocolValidationError, parse_message
 from state import BoardConnState
-
-
-class FakeClock:
-    def __init__(self, now=100.0):
-        self.now = now
-
-    def __call__(self):
-        return self.now
-
-    def advance(self, seconds):
-        self.now += seconds
-
-
-def schema_for(board_id="motor"):
-    return {
-        "type": "schema",
-        "seq": 1,
-        "source": board_id,
-        "target": "controller",
-        "protocol_version": "1",
-        "schema": {
-            "commands": {
-                "move": {"args": {"rpm": "int"}, "blocked_by_estop": True},
-                "status": {"args": {}, "blocked_by_estop": False},
-                "legacy_motion": {"args": {}},
-            },
-            "telemetry": {},
-            "state": {},
-        },
-    }
-
-
-def client_command(seq=1, target="motor", command="move", args=None):
-    return {
-        "type": "command",
-        "seq": seq,
-        "source": "gui",
-        "target": target,
-        "command": command,
-        "args": {} if args is None else args,
-    }
-
-
-def board_ok_response(board_seq, source="motor", *, board_proc_us=None, result=None):
-    if result is None:
-        result = {"accepted": True}
-    response = {
-        "type": "response",
-        "seq": board_seq,
-        "source": source,
-        "target": "controller",
-        "status": "ok",
-        "result": result,
-        "error": None,
-    }
-    if board_proc_us is not None:
-        response["board_proc_us"] = board_proc_us
-    return response
-
-
-class FakeBoardWriter:
-    def __init__(self, *, delay=0.0):
-        self.lock = asyncio.Lock()
-        self.messages = []
-        self.started = asyncio.Event()
-        self.allow_finish = asyncio.Event()
-        self.delay = delay
-        self.use_gate = False
-
-    async def write_message(self, message):
-        async with self.lock:
-            self.started.set()
-            self.messages.append(message)
-            if self.use_gate:
-                await self.allow_finish.wait()
-            if self.delay:
-                await asyncio.sleep(self.delay)
+from tests.conftest import (
+    FakeBoardWriter,
+    FakeClock,
+    async_wait_for,
+    client_command,
+    ok_response,
+    schema_for,
+)
 
 
 class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
@@ -96,11 +27,10 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         return writer
 
     async def wait_for_messages(self, writer, count):
-        for _ in range(100):
-            if len(writer.messages) >= count:
-                return
-            await asyncio.sleep(0)
-        self.fail(f"writer only received {len(writer.messages)} messages, expected {count}")
+        try:
+            await async_wait_for(lambda: len(writer.messages) >= count, timeout=0.5)
+        except AssertionError:
+            self.fail(f"writer only received {len(writer.messages)} messages, expected {count}")
 
     async def test_command_accepted_and_resolved_ok(self):
         controller = self.make_controller()
@@ -110,7 +40,7 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for_messages(writer, 1)
         board_seq = writer.messages[0]["seq"]
 
-        await controller.handle_board_response(board_ok_response(board_seq))
+        await controller.handle_board_response(ok_response(board_seq))
         response = await task
 
         self.assertEqual(response["status"], "ok")
@@ -131,7 +61,7 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(board_command["controller_ts"], 500.25)
         self.assertEqual(board_command["controller_ts"], controller._pending[board_command["seq"]].written_at)
 
-        await controller.handle_board_response(board_ok_response(board_command["seq"]))
+        await controller.handle_board_response(ok_response(board_command["seq"]))
         await task
 
     async def test_command_response_records_monotonic_latency_and_board_proc_us(self):
@@ -144,7 +74,7 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         board_seq = writer.messages[0]["seq"]
         clock.advance(0.125)
         client_response = await controller.handle_board_response(
-            board_ok_response(board_seq, board_proc_us=2400)
+            ok_response(board_seq, board_proc_us=2400)
         )
         response = await task
         observation = controller.state.boards["motor"].last_command_latency
@@ -173,7 +103,7 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         try:
             time.time = lambda: -1_000_000.0
             clock.advance(0.050)
-            response = await controller.handle_board_response(board_ok_response(board_seq))
+            response = await controller.handle_board_response(ok_response(board_seq))
         finally:
             time.time = original_time
         await task
@@ -183,10 +113,10 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_and_invalid_board_proc_us_are_accepted(self):
         for board_response, expected in (
-            (board_ok_response(1), None),
-            (board_ok_response(1, board_proc_us="bad"), None),
-            (board_ok_response(1, board_proc_us=-1), None),
-            (board_ok_response(1, result={"accepted": True, "board_proc_us": 12}), 12.0),
+            (ok_response(1), None),
+            (ok_response(1, board_proc_us="bad"), None),
+            (ok_response(1, board_proc_us=-1), None),
+            (ok_response(1, result={"accepted": True, "board_proc_us": 12}), 12.0),
         ):
             clock = FakeClock(200.0)
             controller = self.make_controller(monotonic_clock=clock)
@@ -325,9 +255,9 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.counters.board_busy_rejections, 1)
         self.assertEqual(controller.fifo_depth_for("motor"), 1)
 
-        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+        await controller.handle_board_response(ok_response(writer.messages[0]["seq"]))
         await self.wait_for_messages(writer, 2)
-        await controller.handle_board_response(board_ok_response(writer.messages[1]["seq"]))
+        await controller.handle_board_response(ok_response(writer.messages[1]["seq"]))
 
         self.assertEqual((await first)["status"], "ok")
         self.assertEqual((await second)["status"], "ok")
@@ -358,7 +288,7 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         )
         await asyncio.sleep(0)
 
-        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+        await controller.handle_board_response(ok_response(writer.messages[0]["seq"]))
         second_response = await asyncio.wait_for(second, timeout=0.2)
 
         self.assertEqual((await first)["status"], "ok")
@@ -377,7 +307,7 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         await self.wait_for_messages(writer, 1)
         board_seq = writer.messages[0]["seq"]
         response = await asyncio.wait_for(task, timeout=0.2)
-        late = await controller.handle_board_response(board_ok_response(board_seq))
+        late = await controller.handle_board_response(ok_response(board_seq))
 
         self.assertEqual(response["status"], "timeout")
         self.assertIsNone(late)
@@ -390,8 +320,8 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(controller.route_command(client_command(seq=1)))
         await self.wait_for_messages(writer, 1)
         board_seq = writer.messages[0]["seq"]
-        first = await controller.handle_board_response(board_ok_response(board_seq))
-        duplicate = await controller.handle_board_response(board_ok_response(board_seq))
+        first = await controller.handle_board_response(ok_response(board_seq))
+        duplicate = await controller.handle_board_response(ok_response(board_seq))
         response = await task
 
         self.assertEqual(first["status"], "ok")
@@ -430,7 +360,7 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         )
         allowed = asyncio.create_task(controller.route_command(client_command(seq=3, command="status")))
         await self.wait_for_messages(writer, 1)
-        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+        await controller.handle_board_response(ok_response(writer.messages[0]["seq"]))
 
         self.assertEqual(blocked["error"]["code"], ErrorCode.ESTOP_ACTIVE.value)
         self.assertEqual(absent_defaults_blocked["error"]["code"], ErrorCode.ESTOP_ACTIVE.value)
@@ -460,7 +390,7 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.fifo_depth_for("motor"), 0)
         self.assertEqual(controller.in_flight_for("motor"), writer.messages[0]["seq"])
 
-        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+        await controller.handle_board_response(ok_response(writer.messages[0]["seq"]))
         self.assertEqual((await command_task)["status"], "ok")
 
     async def test_trigger_estop_clears_fifo_leaves_in_flight_and_sends_estop(self):
@@ -480,7 +410,7 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writer.messages[1]["type"], MessageType.ESTOP.value)
         self.assertIsNotNone(controller.in_flight_for("motor"))
 
-        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+        await controller.handle_board_response(ok_response(writer.messages[0]["seq"]))
         self.assertEqual((await first)["status"], "ok")
 
     async def test_repeated_estop_trigger_is_noop(self):

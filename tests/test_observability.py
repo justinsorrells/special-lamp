@@ -12,7 +12,15 @@ from observability import (
 )
 from protocol import ErrorCode, MessageType
 from state import BoardConnState
-from tests.test_controller_core import FakeBoardWriter, board_ok_response, client_command, schema_for
+from tests.conftest import (
+    FakeBoardWriter,
+    async_wait_for,
+    client_command,
+    schema_for,
+)
+from tests.conftest import (
+    ok_response as board_ok_response,
+)
 
 
 class FakeRedis:
@@ -327,12 +335,10 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(redis.xadds), 1)
 
     async def wait_for(self, predicate, *, timeout=0.5):
-        deadline = asyncio.get_running_loop().time() + timeout
-        while asyncio.get_running_loop().time() < deadline:
-            if predicate():
-                return
-            await asyncio.sleep(0.005)
-        self.fail("condition was not met before timeout")
+        try:
+            await async_wait_for(predicate, timeout=timeout)
+        except AssertionError:
+            self.fail("condition was not met before timeout")
 
 
 if __name__ == "__main__":
