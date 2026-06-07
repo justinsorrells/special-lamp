@@ -170,7 +170,17 @@ class BoardTCPConnection:
             parsed = parse_message(line, max_line_bytes=CONTROLLER_MAX_LINE_BYTES)
             if parsed.ok:
                 return parsed.message
-            # Malformed board input is ignored here; it must not crash the controller.
+            self.controller.observe_controller_event(
+                {
+                    "type": MessageType.EVENT.value,
+                    "source": "controller",
+                    "event": "malformed_board_message",
+                    "details": {
+                        "board_id": self.endpoint.board_id,
+                        "error_code": parsed.error.code.value if parsed.error is not None else None,
+                    },
+                }
+            )
         return None
 
     async def _handle_message(self, message: dict[str, Any]) -> None:
@@ -182,6 +192,7 @@ class BoardTCPConnection:
             board.last_telemetry = message["telemetry"]
             board.last_seen = asyncio.get_running_loop().time()
             self.controller.observe_board_telemetry(message)
+            self.controller.observe_board_state_snapshot(self.endpoint.board_id)
         elif message_type == MessageType.EVENT.value:
             self.controller.observe_controller_event(message)
             await self._handle_event(message)

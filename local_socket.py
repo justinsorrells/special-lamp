@@ -223,6 +223,14 @@ class LocalUnixSocketServer:
                 except asyncio.IncompleteReadError:
                     return
                 except asyncio.LimitOverrunError:
+                    self.controller.observe_controller_event(
+                        {
+                            "type": MessageType.EVENT.value,
+                            "source": "controller",
+                            "event": "malformed_client_message",
+                            "details": {"error_code": ErrorCode.INVALID_JSON.value},
+                        }
+                    )
                     await client.send_response(
                         build_error_response(
                             seq=0,
@@ -234,6 +242,14 @@ class LocalUnixSocketServer:
                     return
                 message, error_response = self._parse_client_line(line)
                 if error_response is not None:
+                    self.controller.observe_controller_event(
+                        {
+                            "type": MessageType.EVENT.value,
+                            "source": "controller",
+                            "event": "malformed_client_message",
+                            "details": {"error_code": error_response["error"]["code"]},
+                        }
+                    )
                     await client.send_response(error_response)
                     continue
                 if message is None:

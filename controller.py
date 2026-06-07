@@ -123,6 +123,7 @@ class ControllerCore:
         board_id = command["target"]
         client_seq = command["seq"]
         client_target = command["source"]
+        self._observe_command_lifecycle_phase(command, board_id=board_id, phase="received")
 
         runtime = self._boards.get(board_id)
         if runtime is None:
@@ -132,7 +133,12 @@ class ControllerCore:
                 code=ErrorCode.UNKNOWN_TARGET,
                 message=f"unknown board {board_id}",
             )
-            self._observe_command_lifecycle(command, response, board_id=board_id)
+            self._observe_command_lifecycle(
+                command,
+                response,
+                board_id=board_id,
+                phase="rejected_unknown_target",
+            )
             return response
         if runtime.writer is None or runtime.state.conn_state is not BoardConnState.REGISTERED:
             response = build_error_response(
@@ -141,7 +147,12 @@ class ControllerCore:
                 code=ErrorCode.BOARD_UNAVAILABLE,
                 message=f"board {board_id} is unavailable",
             )
-            self._observe_command_lifecycle(command, response, board_id=board_id)
+            self._observe_command_lifecycle(
+                command,
+                response,
+                board_id=board_id,
+                phase="board_unavailable",
+            )
             return response
 
         reject = self._reject_for_schema_or_estop(runtime, command)
@@ -152,7 +163,8 @@ class ControllerCore:
                 code=reject,
                 message=f"command {command['command']} rejected with {reject.value}",
             )
-            self._observe_command_lifecycle(command, response, board_id=board_id)
+            phase = "estop_rejected" if reject is ErrorCode.ESTOP_ACTIVE else "rejected"
+            self._observe_command_lifecycle(command, response, board_id=board_id, phase=phase)
             return response
 
         if runtime.state.in_flight_board_seq is not None and len(runtime.fifo) >= self.fifo_depth:
@@ -163,7 +175,12 @@ class ControllerCore:
                 code=ErrorCode.BOARD_BUSY,
                 message=f"board {board_id} command FIFO is full",
             )
-            self._observe_command_lifecycle(command, response, board_id=board_id)
+            self._observe_command_lifecycle(
+                command,
+                response,
+                board_id=board_id,
+                phase="board_busy",
+            )
             return response
 
         loop = asyncio.get_running_loop()
@@ -187,8 +204,20 @@ class ControllerCore:
                 else execution_timeout_s
             ),
         )
+        self._observe_command_lifecycle_phase(
+            command,
+            board_id=board_id,
+            board_seq=pending.board_seq,
+            phase="routed",
+        )
         runtime.fifo.append(pending)
         runtime.state.queue_depth = len(runtime.fifo)
+        self._observe_command_lifecycle_phase(
+            command,
+            board_id=board_id,
+            board_seq=pending.board_seq,
+            phase="queued",
+        )
         self._observe_board_state(runtime.state)
         await self._dispatch_next(board_id)
         return await future
@@ -222,6 +251,7 @@ class ControllerCore:
             client_response,
             board_id=entry.board_id,
             board_seq=board_seq,
+            phase="resolved",
         )
         if not entry.future.done():
             entry.future.set_result(client_response)
@@ -254,6 +284,7 @@ class ControllerCore:
                     popped,
                     ErrorCode.BOARD_UNAVAILABLE,
                     f"board {board_id} went down",
+                    phase="board_unavailable",
                 )
 
         while runtime.fifo:
@@ -262,6 +293,7 @@ class ControllerCore:
                 entry,
                 ErrorCode.BOARD_UNAVAILABLE,
                 f"board {board_id} went down",
+                phase="board_unavailable",
             )
         runtime.state.queue_depth = 0
         runtime.state.in_flight_board_seq = None
@@ -287,6 +319,7 @@ class ControllerCore:
                     entry,
                     ErrorCode.ESTOP_ACTIVE,
                     "queued command rejected: system is in e-stop",
+                    phase="estop_rejected",
                 )
             runtime.state.queue_depth = 0
             self._observe_board_state(runtime.state)
@@ -390,6 +423,7 @@ class ControllerCore:
                     entry,
                     ErrorCode.COMMAND_TIMEOUT,
                     "queued command exceeded residency cap",
+                    phase="queue_timeout",
                 )
                 continue
 
@@ -403,6 +437,13 @@ class ControllerCore:
             entry.written_at = loop.time()
             self._pending[entry.board_seq] = entry
             self._observe_board_state(runtime.state)
+            self._observe_command_lifecycle_phase(
+                entry.command,
+                board_id=board_id,
+                board_seq=entry.board_seq,
+                phase="sent_to_board",
+                controller_ts=entry.written_at,
+            )
             await runtime.writer.write_message(board_command)
             self._timeout_tasks[entry.board_seq] = asyncio.create_task(
                 self._execution_timeout(entry.board_seq, entry.execution_timeout_s)
@@ -424,6 +465,7 @@ class ControllerCore:
             entry,
             ErrorCode.COMMAND_TIMEOUT,
             "command timed out after board write",
+            phase="timeout",
         )
         await self._dispatch_next(entry.board_id)
 
@@ -448,6 +490,8 @@ class ControllerCore:
         entry: PendingCommand,
         code: ErrorCode,
         message: str,
+        *,
+        phase: str = "resolved",
     ) -> None:
         if entry.future.done():
             return
@@ -462,6 +506,7 @@ class ControllerCore:
             response,
             board_id=entry.board_id,
             board_seq=entry.board_seq,
+            phase=phase,
         )
         entry.future.set_result(response)
 
@@ -511,6 +556,7 @@ class ControllerCore:
         response: dict[str, Any],
         *,
         board_id: str,
+        phase: str,
         board_seq: int | None = None,
     ) -> None:
         if self.observability is None:
@@ -523,10 +569,38 @@ class ControllerCore:
                 command_id=command_id,
                 seq=command["seq"],
                 board_id=board_id,
+                phase=phase,
                 status=response["status"],
                 board_seq=board_seq,
                 error_code=error_code,
                 command=command.get("command"),
+            )
+        except Exception:
+            return
+
+    def _observe_command_lifecycle_phase(
+        self,
+        command: dict[str, Any],
+        *,
+        board_id: str,
+        phase: str,
+        board_seq: int | None = None,
+        controller_ts: float | None = None,
+    ) -> None:
+        if self.observability is None:
+            return
+        command_id = f"{board_id}:{board_seq}" if board_seq is not None else f"{board_id}:client:{command['seq']}"
+        try:
+            self.observability.enqueue_command_lifecycle(
+                command_id=command_id,
+                seq=command["seq"],
+                board_id=board_id,
+                phase=phase,
+                status=None,
+                board_seq=board_seq,
+                error_code=None,
+                command=command.get("command"),
+                controller_ts=controller_ts,
             )
         except Exception:
             return

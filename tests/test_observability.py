@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import unittest
 
 from controller import ControllerCore
@@ -7,8 +8,9 @@ from observability import (
     ObservabilityQueue,
     RedisTelemetryWorker,
     serialize_board_state_snapshot,
+    serialize_command_lifecycle,
 )
-from protocol import ErrorCode
+from protocol import ErrorCode, MessageType
 from state import BoardConnState
 from tests.test_controller_core import FakeBoardWriter, board_ok_response, client_command, schema_for
 
@@ -41,6 +43,10 @@ class FakeRedis:
 
 
 class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_queue_requires_positive_bound(self):
+        with self.assertRaises(ValueError):
+            ObservabilityQueue(maxsize=0)
+
     async def test_command_path_still_works_with_redis_disabled(self):
         obs = ObservabilityQueue(maxsize=10)
         worker = RedisTelemetryWorker(redis=None, obs_queue=obs)
@@ -112,6 +118,23 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response["status"], "ok")
 
+    async def test_worker_handles_redis_write_exceptions_without_crashing(self):
+        obs = ObservabilityQueue(maxsize=10)
+        redis = FakeRedis(fail=True)
+        worker = RedisTelemetryWorker(redis=redis, obs_queue=obs)
+        worker.start()
+
+        with self.assertLogs("observability", level=logging.ERROR):
+            obs.enqueue({"kind": "controller_event", "stream": "controller:events", "fields": {"event": "one"}})
+            await self.wait_for(lambda: obs.counters.redis_write_failures == 1)
+            redis.fail = False
+            obs.enqueue({"kind": "controller_event", "stream": "controller:events", "fields": {"event": "two"}})
+            await self.wait_for(lambda: obs.counters.records_written == 1)
+        await worker.stop()
+
+        self.assertEqual(len(redis.xadds), 1)
+        self.assertEqual(redis.xadds[0][1]["event"], "two")
+
     async def test_board_state_snapshot_is_read_replica_only(self):
         obs = ObservabilityQueue(maxsize=10)
         redis = FakeRedis()
@@ -163,19 +186,81 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         await controller.handle_board_response(board_ok_response(board_seq))
         await asyncio.wait_for(command_task, timeout=0.5)
 
-        lifecycle = [item for item in list(obs.queue._queue) if item["kind"] == "command_lifecycle"][-1]
+        lifecycle_items = [item for item in list(obs.queue._queue) if item["kind"] == "command_lifecycle"]
+        phases = [item["fields"]["phase"] for item in lifecycle_items]
+        self.assertEqual(
+            phases[-5:],
+            ["received", "routed", "queued", "sent_to_board", "resolved"],
+        )
+        lifecycle = lifecycle_items[-1]
         fields = lifecycle["fields"]
         self.assertEqual(fields["command_id"], f"motor:{board_seq}")
         self.assertEqual(fields["seq"], 103)
         self.assertEqual(fields["board_id"], "motor")
+        self.assertEqual(fields["phase"], "resolved")
         self.assertEqual(fields["status"], "ok")
         self.assertIsNone(fields["error_code"])
+        self.assertIsInstance(fields["controller_ts"], float)
 
         busy = await controller.route_command(client_command(seq=104, target="missing"))
         lifecycle = [item for item in list(obs.queue._queue) if item["kind"] == "command_lifecycle"][-1]
         self.assertEqual(busy["error"]["code"], ErrorCode.UNKNOWN_TARGET.value)
+        self.assertEqual(lifecycle["fields"]["phase"], "rejected_unknown_target")
         self.assertEqual(lifecycle["fields"]["status"], "error")
         self.assertEqual(lifecycle["fields"]["error_code"], ErrorCode.UNKNOWN_TARGET.value)
+
+    async def test_command_lifecycle_timeout_and_estop_rejection_phases(self):
+        obs = ObservabilityQueue(maxsize=30)
+        controller = ControllerCore(expected_boards={"motor"}, observability=obs)
+        writer = FakeBoardWriter()
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+
+        timeout_task = asyncio.create_task(
+            controller.route_command(client_command(seq=201), execution_timeout_s=0.01)
+        )
+        await self.wait_for(lambda: len(writer.messages) == 1)
+        timeout_response = await asyncio.wait_for(timeout_task, timeout=0.5)
+        controller.state.system.latch_estop()
+        estop_response = await controller.route_command(client_command(seq=202))
+
+        lifecycle_items = [item for item in list(obs.queue._queue) if item["kind"] == "command_lifecycle"]
+        by_seq = {}
+        for item in lifecycle_items:
+            by_seq.setdefault(item["fields"]["seq"], []).append(item["fields"])
+
+        self.assertEqual(timeout_response["status"], "timeout")
+        self.assertEqual(by_seq[201][-1]["phase"], "timeout")
+        self.assertEqual(by_seq[201][-1]["error_code"], ErrorCode.COMMAND_TIMEOUT.value)
+        self.assertEqual(estop_response["error"]["code"], ErrorCode.ESTOP_ACTIVE.value)
+        self.assertEqual(by_seq[202][-1]["phase"], "estop_rejected")
+        self.assertEqual(by_seq[202][-1]["error_code"], ErrorCode.ESTOP_ACTIVE.value)
+
+    async def test_lifecycle_serializer_rejects_new_terminal_statuses(self):
+        with self.assertRaises(ValueError):
+            serialize_command_lifecycle(
+                command_id="motor:1",
+                seq=1,
+                board_id="motor",
+                phase="resolved",
+                status="rejected",
+            )
+
+    async def test_malformed_message_events_can_be_enqueued(self):
+        obs = ObservabilityQueue(maxsize=10)
+        controller = ControllerCore(expected_boards={"motor"}, observability=obs)
+
+        controller.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "malformed_client_message",
+                "details": {"error_code": ErrorCode.INVALID_JSON.value},
+            }
+        )
+
+        event = [item for item in list(obs.queue._queue) if item["kind"] == "controller_event"][-1]
+        self.assertEqual(event["fields"]["event"], "malformed_client_message")
+        self.assertEqual(event["fields"]["details"], {"error_code": ErrorCode.INVALID_JSON.value})
 
     async def test_worker_shutdown_is_clean(self):
         obs = ObservabilityQueue(maxsize=5)

@@ -6,6 +6,7 @@ import unittest
 
 from controller import ControllerCore
 from local_socket import LocalClientConnection, LocalUnixSocketServer
+from observability import ObservabilityQueue
 from protocol import ErrorCode, MessageType
 from state import BoardConnState
 from tests.test_controller_core import FakeBoardWriter, board_ok_response, client_command, schema_for
@@ -127,6 +128,8 @@ class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
             await writer.wait_closed()
 
     async def test_malformed_json_returns_structured_error(self):
+        obs = ObservabilityQueue(maxsize=10)
+        self.controller.observability = obs
         reader, writer = await self.connect_client()
         try:
             writer.write(b"{bad-json\n")
@@ -135,6 +138,9 @@ class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
             response = await read_json(reader)
             self.assertEqual(response["status"], "error")
             self.assertEqual(response["error"]["code"], ErrorCode.INVALID_JSON.value)
+            event = [item for item in list(obs.queue._queue) if item["kind"] == "controller_event"][-1]
+            self.assertEqual(event["fields"]["event"], "malformed_client_message")
+            self.assertEqual(event["fields"]["details"]["error_code"], ErrorCode.INVALID_JSON.value)
         finally:
             writer.close()
             await writer.wait_closed()

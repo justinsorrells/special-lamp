@@ -4,6 +4,7 @@ import unittest
 
 from board_connection import BoardEndpoint, BoardTCPConnection
 from controller import ControllerCore
+from observability import ObservabilityQueue
 from protocol import ErrorCode, MessageType, parse_message
 from state import BoardConnState
 from tests.test_controller_core import client_command, schema_for
@@ -148,6 +149,8 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["result"]["board_seq"], board_command["seq"])
 
     async def test_malformed_board_message_is_handled_safely(self):
+        obs = ObservabilityQueue(maxsize=20)
+        self.controller.observability = obs
         self.server.send_malformed_before_schema = True
         self.start_connection()
         await self.connection.wait_registered()
@@ -159,6 +162,14 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual((await asyncio.wait_for(task, timeout=0.5))["status"], "ok")
         self.assertEqual(self.controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
+        events = [item for item in list(obs.queue._queue) if item["kind"] == "controller_event"]
+        self.assertTrue(
+            any(
+                event["fields"]["event"] == "malformed_board_message"
+                and event["fields"]["details"]["error_code"] == ErrorCode.INVALID_JSON.value
+                for event in events
+            )
+        )
 
     async def test_board_disconnect_calls_board_down(self):
         self.start_connection()
@@ -214,6 +225,8 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(estop_task, timeout=0.5)
 
     async def test_board_telemetry_and_estop_ack_event_update_state(self):
+        obs = ObservabilityQueue(maxsize=20)
+        self.controller.observability = obs
         self.start_connection()
         await self.connection.wait_registered()
 
@@ -227,6 +240,8 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         await self.wait_for(lambda: self.controller.state.boards["motor"].last_telemetry == {"rpm": 100})
+        snapshots = [item for item in list(obs.queue._queue) if item["kind"] == "board_state"]
+        self.assertTrue(any(item["hash"]["last_telemetry"] == {"rpm": 100} for item in snapshots))
 
         await self.server.send_to_latest(
             {

@@ -10,6 +10,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import asyncio
 import json
+import logging
+import time
 from typing import Any, Protocol
 
 from state import BoardState, BoardStateRecord, SystemState, SystemStateRecord
@@ -17,6 +19,10 @@ from state import BoardState, BoardStateRecord, SystemState, SystemStateRecord
 
 DEFAULT_OBS_QUEUE_SIZE = 20_000
 DEFAULT_STREAM_MAXLEN = 100_000
+TERMINAL_STATUSES = {"ok", "error", "timeout"}
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 class AsyncRedisLike(Protocol):
@@ -48,6 +54,8 @@ class ObservabilityQueue:
     """Single bounded drop-oldest observability queue."""
 
     def __init__(self, *, maxsize: int = DEFAULT_OBS_QUEUE_SIZE):
+        if maxsize <= 0:
+            raise ValueError("observability queue maxsize must be positive")
         self.queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=maxsize)
         self.counters = ObservabilityCounters()
         self._next_state_event_id = 1
@@ -94,20 +102,24 @@ class ObservabilityQueue:
         command_id: str,
         seq: int,
         board_id: str,
-        status: str,
+        phase: str,
+        status: str | None = None,
         board_seq: int | None = None,
         error_code: str | None = None,
         command: str | None = None,
+        controller_ts: float | None = None,
     ) -> bool:
         return self.enqueue(
             serialize_command_lifecycle(
                 command_id=command_id,
                 seq=seq,
                 board_id=board_id,
+                phase=phase,
                 status=status,
                 board_seq=board_seq,
                 error_code=error_code,
                 command=command,
+                controller_ts=controller_ts,
             )
         )
 
@@ -162,6 +174,7 @@ class RedisTelemetryWorker:
                 self.obs_queue.counters.records_written += 1
             except Exception:
                 self.obs_queue.counters.redis_write_failures += 1
+                LOGGER.exception("redis observability write failed")
             finally:
                 self.obs_queue.queue.task_done()
 
@@ -254,19 +267,27 @@ def serialize_command_lifecycle(
     command_id: str,
     seq: int,
     board_id: str,
-    status: str,
+    phase: str,
+    status: str | None = None,
     board_seq: int | None = None,
     error_code: str | None = None,
     command: str | None = None,
+    controller_ts: float | None = None,
 ) -> dict[str, Any]:
+    if status is not None and status not in TERMINAL_STATUSES:
+        raise ValueError(f"invalid terminal command status {status!r}")
+    if controller_ts is None:
+        controller_ts = time.monotonic()
     fields = {
         "command_id": command_id,
         "seq": seq,
         "board_id": board_id,
+        "phase": phase,
         "status": status,
         "board_seq": board_seq,
         "error_code": error_code,
         "command": command,
+        "controller_ts": controller_ts,
     }
     return {"kind": "command_lifecycle", "stream": "command:lifecycle", "fields": fields}
 
