@@ -61,6 +61,9 @@ class ControllerCounters:
     commands_completed_error: int = 0
     commands_completed_timeout: int = 0
     stale_command_rejections: int = 0
+    heartbeat_acks_missed: int = 0
+    malformed_heartbeat_acks: int = 0
+    late_heartbeat_acks: int = 0
 
     def increment(self, name: str, amount: int = 1) -> None:
         if name not in self._counter_names():
@@ -491,6 +494,84 @@ class ControllerCore:
 
     def record_critical_event_disconnect(self) -> None:
         self.counters.increment("critical_event_disconnects")
+
+    def record_heartbeat_sent(self, board_id: str, *, seq: int, sent_at: float) -> None:
+        runtime = self._boards[board_id]
+        runtime.state.mark_heartbeat_sent(sent_at)
+        self._observe_board_state(runtime.state)
+        self.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "heartbeat_sent",
+                "details": {"board_id": board_id, "seq": seq},
+            }
+        )
+
+    def record_heartbeat_ack(self, board_id: str, *, seq: int, ack_at: float) -> None:
+        runtime = self._boards[board_id]
+        runtime.state.mark_heartbeat_ack(ack_at)
+        self._observe_board_state(runtime.state)
+        self.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "heartbeat_ack",
+                "details": {"board_id": board_id, "seq": seq},
+            }
+        )
+
+    def record_heartbeat_missed(
+        self,
+        board_id: str,
+        *,
+        seq: int,
+        suspect_after_misses: int,
+    ) -> None:
+        self.counters.increment("heartbeat_acks_missed")
+        runtime = self._boards[board_id]
+        runtime.state.mark_heartbeat_missed(suspect_after_misses=suspect_after_misses)
+        self._observe_board_state(runtime.state)
+        self.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "heartbeat_ack_missed",
+                "details": {
+                    "board_id": board_id,
+                    "seq": seq,
+                    "missed_count": runtime.state.heartbeat_missed_count,
+                    "rx_path_suspect": runtime.state.rx_path_suspect,
+                },
+            }
+        )
+
+    def record_malformed_heartbeat_ack(self, board_id: str, *, seq: Any | None = None) -> None:
+        self.counters.increment("malformed_heartbeat_acks")
+        self.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "malformed_heartbeat_ack",
+                "details": {"board_id": board_id, "seq": seq},
+            }
+        )
+
+    def record_late_heartbeat_ack(self, board_id: str, *, seq: int) -> None:
+        self.counters.increment("late_heartbeat_acks")
+        self.observe_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "late_heartbeat_ack",
+                "details": {"board_id": board_id, "seq": seq},
+            }
+        )
+
+    def mark_heartbeat_disabled(self, board_id: str) -> None:
+        runtime = self._boards[board_id]
+        runtime.state.mark_heartbeat_disabled()
+        self._observe_board_state(runtime.state)
 
     def fifo_depth_for(self, board_id: str) -> int:
         return len(self._boards[board_id].fifo)

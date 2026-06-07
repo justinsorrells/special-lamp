@@ -103,7 +103,7 @@ If a command is not found or fails to run, or if the requested model cannot be v
 ## Stop Conditions & Safety Gates
 
 The orchestrator will immediately halt and require manual intervention if:
-1. **Tests / Checks fail**: `pytest` or `compileall` (which compiles only modified Python files to prevent slow walks) fails. Logs of failed checks are cleanly structured and fed back to Codex.
+1. **Tests / Checks fail**: `pytest`, `compileall` (which compiles only modified Python files to prevent slow walks), or the static architecture invariants checker fails. Logs of failed checks are cleanly structured and fed back to Codex.
 2. **Review fails**:
    - Claude's verdict is `FAIL` or Antigravity's audit verdict is `FAIL`. Verdicts are matched robustly regardless of Markdown emphasis (e.g. `**Final verdict:** PASS`).
    - Claude Code CLI lists items in the `"Must fix before commit:"` section. Negation expressions like `"None"`, `"n/a"`, or `"no issues"` are ignored to avoid false positives.

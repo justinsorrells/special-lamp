@@ -1,12 +1,13 @@
 import asyncio
 import unittest
 
-from board_connection import BoardEndpoint, BoardTCPConnection
+from board_connection import BoardEndpoint, BoardTCPConnection, HeartbeatConfig
 from controller import ControllerCore
 from observability import ObservabilityQueue
 from protocol import ErrorCode, MessageType, parse_message
 from state import BoardConnState
 from tests.conftest import (
+    FakeBoardWriter,
     async_wait_for,
     client_command,
     encode,
@@ -27,6 +28,7 @@ class FakeBoardTCPServer:
         self.send_malformed_before_schema = False
         self.close_after_schema = False
         self.auto_respond = False
+        self.ack_heartbeats = False
 
     async def start(self):
         self.server = await asyncio.start_server(self._handle, "127.0.0.1", 0)
@@ -81,6 +83,18 @@ class FakeBoardTCPServer:
                 await self.commands.put(parsed.message)
                 if parsed.message["type"] == MessageType.COMMAND.value and self.auto_respond:
                     writer.write(encode(ok_response(parsed.message["seq"], self.board_id)))
+                    await writer.drain()
+                elif parsed.message["type"] == MessageType.HEARTBEAT.value and self.ack_heartbeats:
+                    writer.write(
+                        encode(
+                            {
+                                "type": "heartbeat",
+                                "seq": parsed.message["seq"],
+                                "source": self.board_id,
+                                "target": "controller",
+                            }
+                        )
+                    )
                     await writer.drain()
         except ConnectionError:
             return
@@ -275,6 +289,105 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(rate.rate_hz, 0.0)
         self.assertIsNotNone(rate.last_interval_ms)
 
+    async def test_disabled_heartbeat_produces_no_heartbeat_writes(self):
+        self.start_connection()
+        await self.connection.wait_registered()
+
+        task = asyncio.create_task(self.controller.route_command(client_command(seq=30)))
+        board_command = await asyncio.wait_for(self.server.commands.get(), timeout=0.5)
+        await self.server.send_to_latest(ok_response(board_command["seq"]))
+        await task
+
+        self.assertEqual(board_command["type"], MessageType.COMMAND.value)
+        self.assertFalse(self.controller.state.boards["motor"].heartbeat_enabled)
+        self.assertEqual(self.controller.metrics_snapshot()["heartbeat_acks_missed"], 0)
+        self.assertTrue(self.server.commands.empty())
+
+    async def test_enabled_heartbeat_sends_slow_message_and_ack_clears_suspect_state(self):
+        await self.connection.stop()
+        self.server.ack_heartbeats = True
+        self.connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", self.server.port),
+            self.controller,
+            reconnect_delay_s=0.02,
+            heartbeat=HeartbeatConfig(enabled=True, interval_s=0.01, ack_timeout_s=0.05),
+        )
+        self.start_connection()
+        await self.connection.wait_registered()
+
+        heartbeat = await asyncio.wait_for(self.server.commands.get(), timeout=0.5)
+        await self.wait_for(lambda: self.controller.state.boards["motor"].last_heartbeat_ack_at is not None)
+
+        board = self.controller.state.boards["motor"]
+        self.assertEqual(heartbeat["type"], MessageType.HEARTBEAT.value)
+        self.assertEqual(heartbeat["target"], "motor")
+        self.assertTrue(board.heartbeat_enabled)
+        self.assertFalse(board.rx_path_suspect)
+        self.assertEqual(board.heartbeat_missed_count, 0)
+
+    async def test_missed_heartbeat_marks_rx_path_suspect_while_telemetry_still_updates(self):
+        await self.connection.stop()
+        self.connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", self.server.port),
+            self.controller,
+            reconnect_delay_s=0.02,
+            heartbeat=HeartbeatConfig(
+                enabled=True,
+                interval_s=0.01,
+                ack_timeout_s=0.01,
+                suspect_after_misses=2,
+            ),
+        )
+        self.start_connection()
+        await self.connection.wait_registered()
+
+        await asyncio.wait_for(self.server.commands.get(), timeout=0.5)
+        await self.wait_for(
+            lambda: self.controller.metrics_snapshot()["heartbeat_acks_missed"] >= 1,
+            timeout=0.5,
+        )
+        await asyncio.wait_for(self.server.commands.get(), timeout=0.5)
+        await self.wait_for(lambda: self.controller.state.boards["motor"].rx_path_suspect)
+        await self.server.send_to_latest(
+            {
+                "type": "telemetry",
+                "seq": 40,
+                "source": "motor",
+                "target": "controller",
+                "telemetry": {"rpm": 100},
+            }
+        )
+        await self.wait_for(lambda: self.controller.state.boards["motor"].last_telemetry == {"rpm": 100})
+
+        board = self.controller.state.boards["motor"]
+        self.assertTrue(board.rx_path_suspect)
+        self.assertEqual(board.telemetry_rate.sample_count, 1)
+        self.assertGreaterEqual(self.controller.metrics_snapshot()["heartbeat_acks_missed"], 2)
+
+    async def test_late_and_malformed_heartbeat_ack_are_handled_safely(self):
+        self.start_connection()
+        await self.connection.wait_registered()
+
+        await self.connection._handle_message(
+            {
+                "type": "heartbeat",
+                "seq": 999,
+                "source": "motor",
+                "target": "controller",
+            }
+        )
+        await self.connection._handle_message(
+            {
+                "type": "heartbeat",
+                "source": "motor",
+                "target": "controller",
+            }
+        )
+
+        snapshot = self.controller.metrics_snapshot()
+        self.assertEqual(snapshot["late_heartbeat_acks"], 1)
+        self.assertEqual(snapshot["malformed_heartbeat_acks"], 1)
+
 
 class BoardConnectionUnitTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_board_message_counter_increments_without_tcp_socket(self):
@@ -291,6 +404,98 @@ class BoardConnectionUnitTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(message)
         self.assertEqual(controller.metrics_snapshot()["malformed_board_messages"], 1)
+
+    async def test_heartbeat_write_uses_writer_lock_without_socket(self):
+        class LockObservingWriter:
+            def __init__(self):
+                self.lock = asyncio.Lock()
+                self.messages = []
+                self.waiting_for_lock = asyncio.Event()
+
+            async def write_message(self, message):
+                self.waiting_for_lock.set()
+                async with self.lock:
+                    self.messages.append(message)
+
+        controller = ControllerCore(expected_boards={"motor"})
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", 1),
+            controller,
+            heartbeat=HeartbeatConfig(enabled=True, ack_timeout_s=0.05),
+        )
+        writer = LockObservingWriter()
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+
+        await writer.lock.acquire()
+        try:
+            task = asyncio.create_task(connection._send_one_heartbeat(writer))
+            await asyncio.wait_for(writer.waiting_for_lock.wait(), timeout=0.5)
+            self.assertEqual(writer.messages, [])
+        finally:
+            writer.lock.release()
+
+        await async_wait_for(lambda: len(writer.messages) == 1, timeout=0.5)
+        heartbeat = writer.messages[0]
+        self.assertEqual(heartbeat["type"], MessageType.HEARTBEAT.value)
+        await connection._handle_message(
+            {
+                "type": "heartbeat",
+                "seq": heartbeat["seq"],
+                "source": "motor",
+                "target": "controller",
+            }
+        )
+        await asyncio.wait_for(task, timeout=0.5)
+        self.assertFalse(controller.state.boards["motor"].rx_path_suspect)
+
+    async def test_heartbeat_miss_without_socket_marks_rx_path_suspect(self):
+        controller = ControllerCore(expected_boards={"motor"})
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", 1),
+            controller,
+            heartbeat=HeartbeatConfig(
+                enabled=True,
+                ack_timeout_s=0.01,
+                suspect_after_misses=1,
+            ),
+        )
+        writer = FakeBoardWriter()
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+
+        await connection._send_one_heartbeat(writer)
+
+        board = controller.state.boards["motor"]
+        self.assertTrue(board.rx_path_suspect)
+        self.assertEqual(board.heartbeat_missed_count, 1)
+        self.assertEqual(controller.metrics_snapshot()["heartbeat_acks_missed"], 1)
+
+    async def test_late_heartbeat_ack_after_miss_does_not_clear_suspect_state(self):
+        controller = ControllerCore(expected_boards={"motor"})
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", 1),
+            controller,
+            heartbeat=HeartbeatConfig(
+                enabled=True,
+                ack_timeout_s=0.01,
+                suspect_after_misses=1,
+            ),
+        )
+        writer = FakeBoardWriter()
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+
+        await connection._send_one_heartbeat(writer)
+        await connection._handle_message(
+            {
+                "type": "heartbeat",
+                "seq": writer.messages[0]["seq"],
+                "source": "motor",
+                "target": "controller",
+            }
+        )
+
+        board = controller.state.boards["motor"]
+        self.assertTrue(board.rx_path_suspect)
+        self.assertEqual(controller.metrics_snapshot()["late_heartbeat_acks"], 1)
 
 
 if __name__ == "__main__":

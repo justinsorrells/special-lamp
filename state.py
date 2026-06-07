@@ -84,6 +84,11 @@ class BoardState:
     board_id: str
     conn_state: BoardConnState = BoardConnState.DISCONNECTED
     estop_ack: bool = False
+    rx_path_suspect: bool = False
+    heartbeat_enabled: bool = False
+    heartbeat_missed_count: int = 0
+    last_heartbeat_sent_at: float | None = None
+    last_heartbeat_ack_at: float | None = None
     last_telemetry: dict[str, Any] | None = None
     last_seen: float | None = None
     queue_depth: int = 0
@@ -97,6 +102,29 @@ class BoardState:
 
     def mark_estop_ack(self) -> None:
         self.estop_ack = True
+
+    def mark_heartbeat_disabled(self) -> None:
+        self.heartbeat_enabled = False
+        self.rx_path_suspect = False
+        self.heartbeat_missed_count = 0
+        self.last_heartbeat_sent_at = None
+        self.last_heartbeat_ack_at = None
+
+    def mark_heartbeat_sent(self, sent_at: float) -> None:
+        self.heartbeat_enabled = True
+        self.last_heartbeat_sent_at = sent_at
+
+    def mark_heartbeat_ack(self, ack_at: float) -> None:
+        self.heartbeat_enabled = True
+        self.last_heartbeat_ack_at = ack_at
+        self.heartbeat_missed_count = 0
+        self.rx_path_suspect = False
+
+    def mark_heartbeat_missed(self, *, suspect_after_misses: int) -> None:
+        self.heartbeat_enabled = True
+        self.heartbeat_missed_count += 1
+        if self.heartbeat_missed_count >= suspect_after_misses:
+            self.rx_path_suspect = True
 
 
 @dataclass
@@ -127,6 +155,11 @@ class BoardStateRecord:
     board_id: str
     conn_state: BoardConnState
     estop_ack: bool
+    rx_path_suspect: bool = False
+    heartbeat_enabled: bool = False
+    heartbeat_missed_count: int = 0
+    last_heartbeat_sent_at: float | None = None
+    last_heartbeat_ack_at: float | None = None
     last_telemetry: dict[str, Any] | None = None
     last_seen: float | None = None
     queue_depth: int = 0
@@ -144,6 +177,11 @@ class BoardStateRecord:
             board_id=state.board_id,
             conn_state=state.conn_state,
             estop_ack=state.estop_ack,
+            rx_path_suspect=state.rx_path_suspect,
+            heartbeat_enabled=state.heartbeat_enabled,
+            heartbeat_missed_count=state.heartbeat_missed_count,
+            last_heartbeat_sent_at=state.last_heartbeat_sent_at,
+            last_heartbeat_ack_at=state.last_heartbeat_ack_at,
             last_telemetry=state.last_telemetry,
             last_seen=state.last_seen,
             queue_depth=state.queue_depth,
@@ -165,6 +203,11 @@ class BoardStateRecord:
             "board_id": self.board_id,
             "conn_state": self.conn_state.value,
             "estop_ack": self.estop_ack,
+            "rx_path_suspect": self.rx_path_suspect,
+            "heartbeat_enabled": self.heartbeat_enabled,
+            "heartbeat_missed_count": self.heartbeat_missed_count,
+            "last_heartbeat_sent_at": self.last_heartbeat_sent_at,
+            "last_heartbeat_ack_at": self.last_heartbeat_ack_at,
             "last_telemetry": self.last_telemetry,
             "last_seen": self.last_seen,
             "queue_depth": self.queue_depth,
