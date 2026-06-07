@@ -59,6 +59,7 @@ ANTIGRAVITY_PRINT_TIMEOUT = "20m"
 
 DEFAULT_SUBPROCESS_TIMEOUT_S = 30 * 60
 TIMEOUT_EXIT_CODE = 124
+POLICY_EXIT_CODE = 125
 
 
 # Fallback TOML parser to maintain python 3.9 compatibility
@@ -265,6 +266,58 @@ def subprocess_timeout_from_config(config: dict) -> float:
     return timeout
 
 
+def validate_never_auto_policy(config: dict) -> None:
+    """Fail closed if automation push/merge safety flags are disabled."""
+    repo_cfg = config.get("repo", {})
+    for key in ("never_auto_push", "never_auto_merge"):
+        value = repo_cfg.get(key, True)
+        if value is not True:
+            msg = "the orchestrator never auto-pushes or auto-merges"
+            raise ValueError(
+                f"repo.{key} must be true; {msg}"
+            )
+
+
+def _git_subcommand(args: list[str]) -> str | None:
+    if not args or Path(args[0]).name != "git":
+        return None
+
+    index = 1
+    while index < len(args):
+        token = args[index]
+        if token == "--":
+            index += 1
+            break
+        if token in ("-C", "-c", "--git-dir", "--work-tree", "--namespace"):
+            index += 2
+            continue
+        if token.startswith(("-C", "-c", "--git-dir=", "--work-tree=", "--namespace=")):
+            index += 1
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return args[index] if index < len(args) else None
+
+
+def command_blocked_by_never_auto_policy(args: list[str]) -> str | None:
+    subcommand = _git_subcommand(args)
+    if subcommand == "push":
+        return "repo.never_auto_push forbids git push"
+    if subcommand == "merge":
+        return "repo.never_auto_merge forbids git merge"
+
+    if args and Path(args[0]).name in {"bash", "sh", "zsh"}:
+        script = " ".join(args[1:])
+        if re.search(r"\bgit\b(?:(?![;&|]).)*\bpush\b", script):
+            return "repo.never_auto_push forbids shell-wrapped git push"
+        if re.search(r"\bgit\b(?:(?![;&|]).)*\bmerge(?:\s|$)", script):
+            return "repo.never_auto_merge forbids shell-wrapped git merge"
+
+    return None
+
+
 # Shell runner helper
 def run_cmd(
     args: List[str],
@@ -273,6 +326,10 @@ def run_cmd(
     env: Optional[Dict[str, str]] = None,
     timeout_s: Optional[float] = DEFAULT_SUBPROCESS_TIMEOUT_S,
 ) -> Tuple[int, str, str]:
+    blocked_reason = command_blocked_by_never_auto_policy(args)
+    if blocked_reason:
+        return POLICY_EXIT_CODE, "", blocked_reason
+
     try:
         proc_env = os.environ.copy()
         if env:
@@ -485,6 +542,7 @@ class AgentResult:
 
 class Orchestrator:
     def __init__(self, config: dict, dry_run: bool = False, allow_dirty: bool = False):
+        validate_never_auto_policy(config)
         self.config = config
         self.dry_run = dry_run
         self.allow_dirty = allow_dirty

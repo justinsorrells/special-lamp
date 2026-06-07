@@ -11,8 +11,10 @@ from tools.agent_orchestrator.orchestrate import (
     _CONFIDENCE_RE,
     _FINAL_VERDICT_RE,
     DEFAULT_SUBPROCESS_TIMEOUT_S,
+    POLICY_EXIT_CODE,
     TIMEOUT_EXIT_CODE,
     Orchestrator,
+    command_blocked_by_never_auto_policy,
     extract_added_lines,
     git_commit,
     last_anchored_match,
@@ -24,6 +26,7 @@ from tools.agent_orchestrator.orchestrate import (
     run_cmd,
     slugify,
     subprocess_timeout_from_config,
+    validate_never_auto_policy,
 )
 
 
@@ -39,7 +42,9 @@ class TestAgentOrchestrator(unittest.TestCase):
             "repo": {
                 "main_branch": "main",
                 "agent_branch_prefix": "agent/",
-                "require_clean_worktree": True
+                "require_clean_worktree": True,
+                "never_auto_push": True,
+                "never_auto_merge": True
             },
             "checks": {
                 "pytest": False,
@@ -139,6 +144,69 @@ max_limit = 100
             with self.subTest(bad_value=bad_value):
                 with self.assertRaises(ValueError):
                     subprocess_timeout_from_config({"limits": {"subprocess_timeout_s": bad_value}})
+
+    def test_validate_never_auto_policy_accepts_true_or_missing_flags(self):
+        validate_never_auto_policy({"repo": {"never_auto_push": True, "never_auto_merge": True}})
+        validate_never_auto_policy({"repo": {}})
+        validate_never_auto_policy({})
+
+    def test_validate_never_auto_policy_rejects_disabled_or_non_bool_flags(self):
+        for key in ("never_auto_push", "never_auto_merge"):
+            for bad_value in (False, "true", 1, None):
+                with self.subTest(key=key, bad_value=bad_value):
+                    config = {
+                        "repo": {
+                            "never_auto_push": True,
+                            "never_auto_merge": True,
+                            key: bad_value,
+                        }
+                    }
+                    with self.assertRaisesRegex(ValueError, f"repo.{key} must be true"):
+                        validate_never_auto_policy(config)
+
+    def test_orchestrator_init_enforces_never_auto_policy(self):
+        config = dict(self.config)
+        config["repo"] = dict(self.config["repo"])
+        config["repo"]["never_auto_push"] = False
+
+        with self.assertRaisesRegex(ValueError, "never_auto_push"):
+            Orchestrator(config, dry_run=True, allow_dirty=True)
+
+    def test_command_blocked_by_never_auto_policy_rejects_git_push_and_merge(self):
+        blocked_cases = [
+            (["git", "push"], "never_auto_push"),
+            (["git", "-C", "/tmp/repo", "push", "origin", "main"], "never_auto_push"),
+            (["git", "merge", "feature"], "never_auto_merge"),
+            (["git", "-c", "user.name=agent", "merge", "--no-ff", "feature"], "never_auto_merge"),
+            (["bash", "-lc", "git push origin HEAD"], "never_auto_push"),
+            (["zsh", "-c", "cd repo && git merge feature"], "never_auto_merge"),
+        ]
+
+        for args, expected in blocked_cases:
+            with self.subTest(args=args):
+                self.assertIn(expected, command_blocked_by_never_auto_policy(args))
+
+    def test_command_blocked_by_never_auto_policy_allows_non_push_merge_git(self):
+        allowed_cases = [
+            ["git", "status", "--porcelain"],
+            ["git", "commit", "-m", "agent: change"],
+            ["git", "merge-tree", "a", "b"],
+            ["git", "branch", "--show-current"],
+            ["bash", "-lc", "git status --short"],
+        ]
+
+        for args in allowed_cases:
+            with self.subTest(args=args):
+                self.assertIsNone(command_blocked_by_never_auto_policy(args))
+
+    def test_run_cmd_blocks_git_push_and_merge_before_subprocess(self):
+        for args in (["git", "push"], ["git", "merge", "feature"]):
+            with self.subTest(args=args):
+                code, out, err = run_cmd(args)
+
+                self.assertEqual(code, POLICY_EXIT_CODE)
+                self.assertEqual(out, "")
+                self.assertIn("forbids", err)
 
     @patch("tools.agent_orchestrator.orchestrate.subprocess.run")
     def test_run_cmd_passes_timeout_to_subprocess(self, mock_run):
