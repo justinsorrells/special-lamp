@@ -1,4 +1,6 @@
 import shutil
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +10,8 @@ from tools.agent_orchestrator.orchestrate import (
     _ADJUDICATION_RE,
     _CONFIDENCE_RE,
     _FINAL_VERDICT_RE,
+    DEFAULT_SUBPROCESS_TIMEOUT_S,
+    TIMEOUT_EXIT_CODE,
     Orchestrator,
     extract_added_lines,
     last_anchored_match,
@@ -15,7 +19,9 @@ from tools.agent_orchestrator.orchestrate import (
     parse_must_fix,
     parse_per_file_diff,
     parse_simple_toml,
+    run_cmd,
     slugify,
+    subprocess_timeout_from_config,
 )
 
 
@@ -41,7 +47,8 @@ class TestAgentOrchestrator(unittest.TestCase):
             },
             "limits": {
                 "max_changed_files": 5,
-                "max_diff_lines": 50
+                "max_diff_lines": 50,
+                "subprocess_timeout_s": DEFAULT_SUBPROCESS_TIMEOUT_S
             },
             "review": {
                 "allow_claude_override_antigravity": True,
@@ -121,6 +128,73 @@ max_limit = 100
         self.assertEqual(parsed["repo"]["require_clean_worktree"], False)
         self.assertEqual(parsed["repo"]["never_auto_push"], True)
         self.assertEqual(parsed["repo"]["max_limit"], 100)
+
+    def test_subprocess_timeout_from_config_defaults_and_validates(self):
+        self.assertEqual(subprocess_timeout_from_config({}), DEFAULT_SUBPROCESS_TIMEOUT_S)
+        self.assertEqual(subprocess_timeout_from_config({"limits": {"subprocess_timeout_s": 12}}), 12.0)
+
+        for bad_value in (0, -1, "not-a-number"):
+            with self.subTest(bad_value=bad_value):
+                with self.assertRaises(ValueError):
+                    subprocess_timeout_from_config({"limits": {"subprocess_timeout_s": bad_value}})
+
+    @patch("tools.agent_orchestrator.orchestrate.subprocess.run")
+    def test_run_cmd_passes_timeout_to_subprocess(self, mock_run):
+        mock_run.return_value = subprocess.CompletedProcess(["tool"], 0, "out", "err")
+
+        code, out, err = run_cmd(["tool"], timeout_s=7)
+
+        self.assertEqual((code, out, err), (0, "out", "err"))
+        self.assertEqual(mock_run.call_args.kwargs["timeout"], 7)
+
+    @patch("tools.agent_orchestrator.orchestrate.subprocess.run")
+    def test_run_cmd_returns_timeout_result_with_partial_output(self, mock_run):
+        mock_run.side_effect = subprocess.TimeoutExpired(
+            cmd=["tool", "arg"],
+            timeout=3,
+            output=b"partial stdout",
+            stderr=b"partial stderr",
+        )
+
+        code, out, err = run_cmd(["tool", "arg"], timeout_s=3)
+
+        self.assertEqual(code, TIMEOUT_EXIT_CODE)
+        self.assertEqual(out, "partial stdout")
+        self.assertIn("partial stderr", err)
+        self.assertIn("Command timed out after 3s: tool arg", err)
+
+    def test_run_cmd_times_out_real_subprocess(self):
+        code, out, err = run_cmd(
+            [
+                sys.executable,
+                "-c",
+                "import time; print('started', flush=True); time.sleep(5)",
+            ],
+            timeout_s=0.1,
+        )
+
+        self.assertEqual(code, TIMEOUT_EXIT_CODE)
+        self.assertIn("started", out)
+        self.assertIn("Command timed out after 0.1s", err)
+
+    @patch("tools.agent_orchestrator.orchestrate.run_cmd")
+    def test_orchestrator_run_cmd_uses_configured_timeout(self, mock_run):
+        config = dict(self.config)
+        config["limits"] = dict(self.config["limits"])
+        config["limits"]["subprocess_timeout_s"] = 23
+        orchestrator = Orchestrator(config, dry_run=True, allow_dirty=True)
+        mock_run.return_value = (0, "out", "")
+
+        res = orchestrator.run_cmd(["tool"], input_str="prompt")
+
+        self.assertEqual(res, (0, "out", ""))
+        mock_run.assert_called_once_with(
+            ["tool"],
+            input_str="prompt",
+            cwd=None,
+            env=None,
+            timeout_s=23.0,
+        )
 
     def test_slugify(self):
         self.assertEqual(slugify("Task: Implement Redis integration!"), "task-implement-redis-integration")
@@ -300,6 +374,7 @@ diff --git a/controller.py b/controller.py
         example_cfg = parse_simple_toml(example_toml_path)
         self.assertEqual(example_cfg["checks"]["invariants"], True)
         self.assertEqual(example_cfg["review"]["allow_claude_override_antigravity"], True)
+        self.assertEqual(example_cfg["limits"]["subprocess_timeout_s"], DEFAULT_SUBPROCESS_TIMEOUT_S)
 
     def test_backlog_extraction_with_nested_bullets(self):
         backlog_content = """# Backlog

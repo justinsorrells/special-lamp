@@ -30,6 +30,7 @@ invariants = true
 max_changed_files = 30
 max_diff_lines = 2500
 max_task_cycles = 5
+subprocess_timeout_s = 1800
 
 [review]
 allow_claude_override_antigravity = true

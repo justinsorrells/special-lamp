@@ -54,9 +54,11 @@ def last_anchored_match(pattern: "re.Pattern[str]", text: str) -> Optional[str]:
 
 # agy --print defaults to a 5-minute wait; a real audit explores the repo and can
 # take longer (observed ~8 min), so we give it generous headroom to avoid
-# truncating a legitimate audit into an unparseable (verdict-less) response. A
-# proper config-driven subprocess timeout is tracked separately in the backlog.
+# truncating a legitimate audit into an unparseable (verdict-less) response.
 ANTIGRAVITY_PRINT_TIMEOUT = "20m"
+
+DEFAULT_SUBPROCESS_TIMEOUT_S = 30 * 60
+TIMEOUT_EXIT_CODE = 124
 
 
 # Fallback TOML parser to maintain python 3.9 compatibility
@@ -221,7 +223,8 @@ def load_config(config_path: Optional[Path] = None) -> dict:
         "limits": {
             "max_changed_files": 30,
             "max_diff_lines": 2500,
-            "max_task_cycles": 5
+            "max_task_cycles": 5,
+            "subprocess_timeout_s": DEFAULT_SUBPROCESS_TIMEOUT_S
         },
         "review": {
             "allow_claude_override_antigravity": True,
@@ -243,8 +246,33 @@ def load_config(config_path: Optional[Path] = None) -> dict:
         }
     }
 
+def timeout_output_to_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return str(value)
+
+
+def subprocess_timeout_from_config(config: dict) -> float:
+    raw_timeout = config.get("limits", {}).get("subprocess_timeout_s", DEFAULT_SUBPROCESS_TIMEOUT_S)
+    try:
+        timeout = float(raw_timeout)
+    except (TypeError, ValueError) as e:
+        raise ValueError("limits.subprocess_timeout_s must be a positive number") from e
+    if timeout <= 0:
+        raise ValueError("limits.subprocess_timeout_s must be a positive number")
+    return timeout
+
+
 # Shell runner helper
-def run_cmd(args: List[str], input_str: Optional[str] = None, cwd: Optional[Path] = None, env: Optional[Dict[str, str]] = None) -> Tuple[int, str, str]:
+def run_cmd(
+    args: List[str],
+    input_str: Optional[str] = None,
+    cwd: Optional[Path] = None,
+    env: Optional[Dict[str, str]] = None,
+    timeout_s: Optional[float] = DEFAULT_SUBPROCESS_TIMEOUT_S,
+) -> Tuple[int, str, str]:
     try:
         proc_env = os.environ.copy()
         if env:
@@ -261,9 +289,19 @@ def run_cmd(args: List[str], input_str: Optional[str] = None, cwd: Optional[Path
             capture_output=True,
             text=True,
             cwd=str(cwd) if cwd else None,
-            env=proc_env
+            env=proc_env,
+            timeout=timeout_s
         )
         return res.returncode, res.stdout, res.stderr
+    except subprocess.TimeoutExpired as e:
+        stdout = timeout_output_to_text(e.stdout)
+        stderr = timeout_output_to_text(e.stderr)
+        timeout_msg = f"Command timed out after {e.timeout:g}s: {' '.join(args)}"
+        if stderr:
+            stderr = f"{stderr}\n{timeout_msg}"
+        else:
+            stderr = timeout_msg
+        return TIMEOUT_EXIT_CODE, stdout, stderr
     except FileNotFoundError as e:
         return 127, "", f"Command not found: {args[0]} ({str(e)})"
     except Exception as e:
@@ -408,10 +446,20 @@ class Orchestrator:
         self.config = config
         self.dry_run = dry_run
         self.allow_dirty = allow_dirty
+        self.subprocess_timeout_s = subprocess_timeout_from_config(config)
         self.run_dir: Optional[Path] = None
         self.models_verified = {}
         self.agent_runs_parent = Path(".agent_runs")
         self.final_artifacts = {}
+
+    def run_cmd(
+        self,
+        args: List[str],
+        input_str: Optional[str] = None,
+        cwd: Optional[Path] = None,
+        env: Optional[Dict[str, str]] = None,
+    ) -> Tuple[int, str, str]:
+        return run_cmd(args, input_str=input_str, cwd=cwd, env=env, timeout_s=self.subprocess_timeout_s)
 
     def log_artifact(self, filename: str, content: str):
         if self.run_dir:
@@ -428,9 +476,9 @@ class Orchestrator:
         codex_model = codex_cfg.get("model", "gpt-5.5")
         
         print(f"Probing Codex (cmd: {codex_cmd}, model: {codex_model})...")
-        code1, out1, err1 = run_cmd([codex_cmd, "--version"])
-        code2, out2, err2 = run_cmd([codex_cmd, "--help"])
-        code3, out3, err3 = run_cmd([codex_cmd, "exec", "--help"])
+        code1, out1, err1 = self.run_cmd([codex_cmd, "--version"])
+        code2, out2, err2 = self.run_cmd([codex_cmd, "--help"])
+        code3, out3, err3 = self.run_cmd([codex_cmd, "exec", "--help"])
         
         codex_ok = (code1 == 0 or code2 == 0)
         self.models_verified["codex"] = {
@@ -445,9 +493,9 @@ class Orchestrator:
         claude_model = claude_cfg.get("model", "opus")
         
         print(f"Probing Claude CLI (cmd: {claude_cmd}, model: {claude_model})...")
-        cl_code1, cl_out1, cl_err1 = run_cmd([claude_cmd, "--version"])
-        cl_code2, cl_out2, cl_err2 = run_cmd([claude_cmd, "--help"])
-        cl_code3, cl_out3, cl_err3 = run_cmd([claude_cmd, "-p", "--help"])
+        cl_code1, cl_out1, cl_err1 = self.run_cmd([claude_cmd, "--version"])
+        cl_code2, cl_out2, cl_err2 = self.run_cmd([claude_cmd, "--help"])
+        cl_code3, cl_out3, cl_err3 = self.run_cmd([claude_cmd, "-p", "--help"])
         
         claude_ok = (cl_code1 == 0 or cl_code2 == 0)
         self.models_verified["claude"] = {
@@ -462,8 +510,8 @@ class Orchestrator:
         anti_model = anti_cfg.get("model", "gemini-3.5-flash")
         
         print(f"Probing Antigravity CLI (cmd: {anti_cmd}, model: {anti_model})...")
-        ant_code1, ant_out1, ant_err1 = run_cmd([anti_cmd, "--version"])
-        ant_code2, ant_out2, ant_err2 = run_cmd([anti_cmd, "--help"])
+        ant_code1, ant_out1, ant_err1 = self.run_cmd([anti_cmd, "--version"])
+        ant_code2, ant_out2, ant_err2 = self.run_cmd([anti_cmd, "--help"])
         
         # Check if actually available
         antigravity_ok = (ant_code1 == 0 or ant_code2 == 0)
@@ -510,7 +558,7 @@ class Orchestrator:
                 results["compileall"] = "No Python files changed."
             else:
                 print(f"Compiling changed Python files: {changed_py_files}")
-                code, out, err = run_cmd([py_bin, "-m", "compileall"] + changed_py_files)
+                code, out, err = self.run_cmd([py_bin, "-m", "compileall"] + changed_py_files)
                 results["compileall"] = out + "\n" + err
                 self.log_artifact("compileall.txt", results["compileall"])
                 if code != 0:
@@ -527,7 +575,7 @@ class Orchestrator:
         if checks_cfg.get("pytest", True):
             print("Running pytest...")
             pytest_bin = ".venv/bin/pytest" if Path(".venv/bin/pytest").exists() else "pytest"
-            code, out, err = run_cmd([pytest_bin], env={"PYTHONPATH": str(Path.cwd())})
+            code, out, err = self.run_cmd([pytest_bin], env={"PYTHONPATH": str(Path.cwd())})
             results["pytest"] = out + "\n" + err
             self.log_artifact("pytest.txt", results["pytest"])
             if code != 0:
@@ -545,7 +593,7 @@ class Orchestrator:
         ruff_mode = checks_cfg.get("ruff", "auto")
         if ruff_mode in (True, "auto"):
             print("Running ruff...")
-            code, out, err = run_cmd(["ruff", "check", "."])
+            code, out, err = self.run_cmd(["ruff", "check", "."])
             results["ruff"] = out + "\n" + err
             self.log_artifact("ruff.txt", results["ruff"])
             if code == 127: # not found
@@ -573,7 +621,7 @@ class Orchestrator:
         if mypy_mode in (True, "auto"):
             print("Running mypy...")
             mypy_bin = ".venv/bin/mypy" if Path(".venv/bin/mypy").exists() else "mypy"
-            code, out, err = run_cmd([mypy_bin, "."], env={"PYTHONPATH": str(Path.cwd())})
+            code, out, err = self.run_cmd([mypy_bin, "."], env={"PYTHONPATH": str(Path.cwd())})
             results["mypy"] = out + "\n" + err
             self.log_artifact("mypy.txt", results["mypy"])
             if code == 127: # not found
@@ -600,7 +648,7 @@ class Orchestrator:
         if checks_cfg.get("invariants", True):
             print("Running invariants check...")
             py_bin = ".venv/bin/python" if Path(".venv/bin/python").exists() else "python3"
-            code, out, err = run_cmd([py_bin, "tools/check_invariants.py"])
+            code, out, err = self.run_cmd([py_bin, "tools/check_invariants.py"])
             results["invariants"] = out + "\n" + err
             self.log_artifact("check_invariants.txt", results["invariants"])
             if code != 0:
@@ -745,7 +793,7 @@ class Orchestrator:
             print(f"Switching from '{main_br}' to agent branch '{agent_branch}'...")
             if not self.dry_run:
                 # Check if branch already exists
-                code, _, _ = run_cmd(["git", "show-ref", f"refs/heads/{agent_branch}"])
+                code, _, _ = self.run_cmd(["git", "show-ref", f"refs/heads/{agent_branch}"])
                 if code == 0:
                     success = git_switch_branch(agent_branch)
                 else:
@@ -847,7 +895,7 @@ class Orchestrator:
             codex_cmd.append("--sandbox=workspace-write")
             
             print(f"Invoking Codex CLI implementation (cycle {cycle})...")
-            code, out, err = run_cmd(codex_cmd, input_str=current_prompt)
+            code, out, err = self.run_cmd(codex_cmd, input_str=current_prompt)
             
             self.final_artifacts["codex_stdout.txt"] = out
             self.final_artifacts["codex_stderr.txt"] = err
@@ -860,7 +908,7 @@ class Orchestrator:
                 return "STOP_TOOL_ERROR"
 
             # Stage newly-created files so they are visible to git status / git diff (B1)
-            run_cmd(["git", "add", "-N", "."])
+            self.run_cmd(["git", "add", "-N", "."])
 
             # 6. Capture changes
             status_after = git_status_porcelain()
@@ -920,7 +968,7 @@ class Orchestrator:
             claude_cmd = [claude_cfg["command"], "-p", "--model", claude_cfg["model"]]
             
             print(f"Invoking Claude CLI review (cycle {cycle})...")
-            cl_code, cl_out, cl_err = run_cmd(claude_cmd, input_str=claude_prompt)
+            cl_code, cl_out, cl_err = self.run_cmd(claude_cmd, input_str=claude_prompt)
             
             self.final_artifacts["claude_stdout.txt"] = cl_out
             self.final_artifacts["claude_stderr.txt"] = cl_err
@@ -987,7 +1035,7 @@ class Orchestrator:
                 anti_cfg["model"],
             ]
             
-            ant_code, ant_out, ant_err = run_cmd(anti_cmd, input_str=antigravity_prompt)
+            ant_code, ant_out, ant_err = self.run_cmd(anti_cmd, input_str=antigravity_prompt)
             
             self.final_artifacts["antigravity_audit.md"] = ant_out
             self.log_artifact(f"antigravity_stdout_cycle_{cycle}.txt", ant_out)
@@ -1099,7 +1147,7 @@ class Orchestrator:
                 self.log_artifact(f"claude_adjudication_prompt_cycle_{cycle}.md", claude_adjudication_prompt)
                 
                 print("Invoking Claude CLI to adjudicate Antigravity concerns...")
-                cl_eval_code, cl_eval_out, cl_eval_err = run_cmd(claude_cmd, input_str=claude_adjudication_prompt)
+                cl_eval_code, cl_eval_out, cl_eval_err = self.run_cmd(claude_cmd, input_str=claude_adjudication_prompt)
                 
                 self.final_artifacts["claude_adjudication.md"] = cl_eval_out
                 self.log_artifact(f"claude_adjudication_stdout_cycle_{cycle}.txt", cl_eval_out)
@@ -1158,7 +1206,7 @@ class Orchestrator:
                 return "STOP_TOOL_ERROR"
 
             # Get latest commit hash
-            _, ref_out, _ = run_cmd(["git", "rev-parse", "HEAD"])
+            _, ref_out, _ = self.run_cmd(["git", "rev-parse", "HEAD"])
             commit_hash = ref_out.strip()
 
             self.log_report(
