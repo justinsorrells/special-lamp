@@ -610,3 +610,28 @@ General rules for every task:
 
   unless explicitly authorized by the operator.
 
+---
+
+* [ ] Task: Implement subprocess timeouts in orchestrator command execution
+
+  ## Goal
+
+  Add execution timeouts around the subprocess execution (`run_cmd`) within the agent orchestrator to prevent a hung or wedged agent CLI command from hanging the entire orchestrator execution loop indefinitely.
+
+---
+
+* [ ] Task: Narrow orchestrator git commit scope
+
+  ## Goal
+
+  Update the orchestrator's git commit stage (`git_commit`) to stage and commit only the specific files that were reviewed, audited, and approved, rather than using `git add -A` which stages and commits the entire worktree indiscriminately.
+
+---
+
+* [ ] Task: Active enforcement of never_auto_push and never_auto_merge
+
+  ## Goal
+
+  Actively enforce the `never_auto_push` and `never_auto_merge` config flags in the orchestrator codebase. Currently, auto-push and auto-merge behavior is only prevented by omission (the orchestrator just does not implement them). They should be explicitly validated and strictly enforced in code.
+
+
