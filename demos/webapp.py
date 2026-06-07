@@ -15,6 +15,10 @@ schemas = {}
 
 app = FastAPI()
 
+# UDP socket used by the /run endpoint to talk to a board server.
+webAppClientSocket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+webAppClientSocket.settimeout(0.5)
+
 last_result: str | None = None
 sent_msg: str | None = None
 
@@ -73,7 +77,7 @@ def index():
 @app.post("/run/{subsystem}/{entry}")
 def run(subsystem: str, entry: str):
     global last_result, sent_msg
-    webAppClientSocket.sendto(entry, HOSTPORTS[subsystem])
+    webAppClientSocket.sendto(entry.encode("utf-8"), HOSTPORTS[int(subsystem)])
     sent_msg = f"*sent command {entry} to hostname {subsystem}*"
     dataRec = webAppClientSocket.recvfrom(1024)
     last_result = dataRec

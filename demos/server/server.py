@@ -42,7 +42,7 @@ def evaluate_command(cmd: str, args: list[Any]) -> Any:
         sig = inspect.signature(func)
         sig.bind(*args)
     except TypeError as e:
-        raise ValueError(f"bad arguments for {cmd}: {e}") 
+        raise ValueError(f"bad arguments for {cmd}: {e}") from e
     return func(*args)
 
 def generate_response(packet):
