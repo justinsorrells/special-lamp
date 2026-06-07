@@ -221,7 +221,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Implement monotonic clock latency & telemetry rate tracking
+* [x] Task: Implement monotonic clock latency & telemetry rate tracking
 
   ## Goal
 
