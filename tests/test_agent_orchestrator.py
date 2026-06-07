@@ -81,6 +81,23 @@ class TestAgentOrchestrator(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.temp_dir)
 
+    def test_antigravity_verdict_extraction_fallback(self):
+        from unittest.mock import patch as _patch
+        orch = self.orchestrator
+        # agy concluded its audit in prose; a focused re-prompt yields the token.
+        with _patch.object(orch, "run_cmd", return_value=(0, "Final verdict: PASS", "")) as mock_run:
+            self.assertEqual(
+                orch._extract_antigravity_verdict(["agy", "--print"], "Audit done. Clean, safe, ready to commit.", 1),
+                "PASS",
+            )
+            self.assertIn("Based ONLY on that audit", mock_run.call_args.kwargs["input_str"])
+        # Re-prompt still produces no verdict -> None (fail closed, not a guess).
+        with _patch.object(orch, "run_cmd", return_value=(0, "still rambling, no token", "")):
+            self.assertIsNone(orch._extract_antigravity_verdict(["agy"], "audit", 1))
+        # Extraction call fails -> None.
+        with _patch.object(orch, "run_cmd", return_value=(1, "", "boom")):
+            self.assertIsNone(orch._extract_antigravity_verdict(["agy"], "audit", 1))
+
     def test_verdict_parsing_markdown_tolerant_and_anchored(self):
         # Markdown emphasis, headings, blockquotes, and trailing punctuation parse.
         self.assertEqual(last_anchored_match(_FINAL_VERDICT_RE, "Final verdict: PASS"), "PASS")

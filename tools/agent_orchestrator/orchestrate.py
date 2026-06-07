@@ -851,6 +851,35 @@ class Orchestrator:
 
         return None
 
+    def _extract_antigravity_verdict(self, anti_cmd: List[str], audit_text: str, cycle: int) -> Optional[str]:
+        """Force a one-line verdict when agy concluded its audit in prose.
+
+        Unlike ``claude -p`` / ``codex exec``, agy is non-deterministic about emitting
+        the required ``Final verdict:`` token: it often ends with a narrative summary
+        and writes the formal report to its own brain dir, leaving no parseable verdict
+        on stdout. Re-prompt agy with its own audit text and a minimal verdict-only
+        instruction (which it reliably complies with) to normalize the format. agy
+        remains the decider; this does not re-judge the change. Returns ``PASS``/``FAIL``
+        (raw case) or ``None`` if still unparseable.
+        """
+        extraction_prompt = (
+            "Below is an audit you already produced of a code change.\n\n"
+            "===== YOUR AUDIT =====\n"
+            f"{audit_text}\n"
+            "===== END AUDIT =====\n\n"
+            "Based ONLY on that audit, reply with EXACTLY one line and nothing else:\n"
+            "Final verdict: PASS   (if the audit found no blocking issues)\n"
+            "Final verdict: FAIL   (if the audit found blocking issues)"
+        )
+        self.log_artifact(f"antigravity_verdict_extraction_prompt_cycle_{cycle}.md", extraction_prompt)
+        code, out, err = self.run_cmd(anti_cmd, input_str=extraction_prompt)
+        self.log_artifact(f"antigravity_verdict_extraction_stdout_cycle_{cycle}.txt", out)
+        self.log_artifact(f"antigravity_verdict_extraction_stderr_cycle_{cycle}.txt", err)
+        if code != 0:
+            print(f"Antigravity verdict-extraction call exited with code {code}.")
+            return None
+        return last_anchored_match(_FINAL_VERDICT_RE, out)
+
     def execute_task(self, task_file: Path) -> str:
         """Executes a single task following the autonomous loop."""
         # Setup run folder
@@ -1151,8 +1180,14 @@ class Orchestrator:
             # Parse Antigravity verdict safely (anchored, markdown-tolerant, last match)
             anti_verdict = last_anchored_match(_FINAL_VERDICT_RE, ant_out)
             if anti_verdict is None:
-                print("Antigravity audit response was missing a valid final verdict.")
-                self.log_report(task_title, agent_branch, "STOP_ANTIGRAVITY_AUDIT_FAILED", "Could not parse PASS/FAIL verdict from Antigravity audit.")
+                # agy frequently concludes its audit in prose without the required
+                # `Final verdict:` token. Re-prompt it with its own audit text to force
+                # a one-line verdict before giving up.
+                print("Antigravity audit produced no parseable verdict; requesting an explicit verdict line...")
+                anti_verdict = self._extract_antigravity_verdict(anti_cmd, ant_out, cycle)
+            if anti_verdict is None:
+                print("Antigravity audit response was missing a valid final verdict (after verdict-extraction retry).")
+                self.log_report(task_title, agent_branch, "STOP_ANTIGRAVITY_AUDIT_FAILED", "Could not parse PASS/FAIL verdict from Antigravity audit, including the verdict-extraction retry.")
                 return "STOP_ANTIGRAVITY_AUDIT_FAILED"
 
             anti_verdict = anti_verdict.upper()
