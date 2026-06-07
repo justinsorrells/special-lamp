@@ -39,6 +39,7 @@ class LocalClientConnection:
     writer: asyncio.StreamWriter
     outbound_maxsize: int
     on_event_dropped: Callable[[], None] | None = None
+    on_critical_disconnect: Callable[[], None] | None = None
     connected: bool = True
     outbound: asyncio.Queue[_OutboundMessage | None] = field(init=False)
     writer_task: asyncio.Task[None] | None = None
@@ -115,6 +116,7 @@ class LocalClientConnection:
             if not self.outbound.full():
                 self.outbound.put_nowait(item)
                 return True
+            self._record_critical_disconnect()
             await self.close(flush=False)
             return False
 
@@ -139,6 +141,10 @@ class LocalClientConnection:
         if self.on_event_dropped is not None:
             self.on_event_dropped()
 
+    def _record_critical_disconnect(self) -> None:
+        if self.on_critical_disconnect is not None:
+            self.on_critical_disconnect()
+
     async def _put_sentinel(self) -> None:
         try:
             self.outbound.put_nowait(None)
@@ -150,6 +156,15 @@ class LocalClientConnection:
 
 class LocalUnixSocketServer:
     """Full-duplex Unix socket server for local controller clients."""
+
+    _CRITICAL_EVENT_NAMES = frozenset(
+        {
+            "estop_triggered",
+            "estop_ack",
+            "safety_fault",
+            "safety_state",
+        }
+    )
 
     def __init__(
         self,
@@ -166,6 +181,7 @@ class LocalUnixSocketServer:
         self.server: asyncio.AbstractServer | None = None
         self.clients: set[LocalClientConnection] = set()
         self.client_event_dropped = 0
+        self.critical_event_disconnects = 0
 
     async def start(self) -> None:
         await self._prepare_socket_path()
@@ -186,10 +202,12 @@ class LocalUnixSocketServer:
         if os.path.exists(self.socket_path):
             os.unlink(self.socket_path)
 
-    async def broadcast_event(self, event: dict[str, Any], *, critical: bool = True) -> None:
+    async def broadcast_event(self, event: dict[str, Any], *, critical: bool | None = None) -> None:
         validate_message(event)
         if event["type"] != MessageType.EVENT.value:
             raise ProtocolValidationError(ErrorCode.INVALID_TYPE, "broadcast message must be an event")
+        if critical is None:
+            critical = self._is_critical_event(event)
         await asyncio.gather(
             *(client.send_event(event, critical=critical) for client in list(self.clients)),
             return_exceptions=True,
@@ -213,6 +231,7 @@ class LocalUnixSocketServer:
             writer=writer,
             outbound_maxsize=self.outbound_queue_size,
             on_event_dropped=self._increment_client_event_dropped,
+            on_critical_disconnect=self._increment_critical_event_disconnects,
         )
         self.clients.add(client)
         client.writer_task = asyncio.create_task(client.writer_loop())
@@ -293,6 +312,15 @@ class LocalUnixSocketServer:
 
     def _increment_client_event_dropped(self) -> None:
         self.client_event_dropped += 1
+
+    def _increment_critical_event_disconnects(self) -> None:
+        self.critical_event_disconnects += 1
+
+    def _is_critical_event(self, event: dict[str, Any]) -> bool:
+        event_name = event.get("event")
+        if not isinstance(event_name, str):
+            return True
+        return event_name.startswith("estop") or event_name in self._CRITICAL_EVENT_NAMES
 
     def _parse_client_line(
         self,

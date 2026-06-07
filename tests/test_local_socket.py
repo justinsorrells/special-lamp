@@ -67,6 +67,141 @@ class FakeLocalWriter:
         pass
 
 
+class LocalSocketBackpressureTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.controller = ControllerCore(expected_boards={"motor"})
+        self.server = LocalUnixSocketServer(socket_path="/tmp/unbound-controller.sock", controller=self.controller)
+
+    async def asyncTearDown(self):
+        await asyncio.gather(*(client.close(flush=False) for client in list(self.server.clients)), return_exceptions=True)
+        self.server.clients.clear()
+
+    async def test_outbound_queue_depth_default_is_1000(self):
+        self.assertEqual(self.server.outbound_queue_size, 1000)
+
+    async def test_noncritical_event_backpressure_drops_oldest_and_counts(self):
+        client = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=2,
+            on_event_dropped=self.server._increment_client_event_dropped,
+        )
+
+        self.assertTrue(await client.send_event(event_message(1), critical=False))
+        self.assertTrue(await client.send_event(event_message(2), critical=False))
+        self.assertTrue(await client.send_event(event_message(3), critical=False))
+
+        self.assertEqual(self.server.client_event_dropped, 1)
+        self.assertEqual([message["event_id"] for message in queued_payloads(client)], [2, 3])
+        self.assertTrue(client.is_connected)
+
+    async def test_critical_backpressure_evicts_noncritical_before_disconnect(self):
+        client = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=2,
+            on_event_dropped=self.server._increment_client_event_dropped,
+            on_critical_disconnect=self.server._increment_critical_event_disconnects,
+        )
+
+        self.assertTrue(await client.send_event(event_message(1), critical=False))
+        self.assertTrue(await client.send_response(ok_response(2)))
+        self.assertTrue(await client.send_response(ok_response(3)))
+
+        self.assertEqual(self.server.client_event_dropped, 1)
+        self.assertEqual(self.server.critical_event_disconnects, 0)
+        self.assertEqual([message["seq"] for message in queued_payloads(client)], [2, 3])
+        self.assertTrue(client.is_connected)
+
+    async def test_critical_backpressure_disconnects_when_only_critical_messages_are_queued(self):
+        client = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=1,
+            on_critical_disconnect=self.server._increment_critical_event_disconnects,
+        )
+
+        self.assertTrue(await client.send_response(ok_response(1)))
+        self.assertFalse(await client.send_response(ok_response(2)))
+
+        self.assertFalse(client.connected)
+        self.assertTrue(client.writer.closed)
+        self.assertEqual(self.server.critical_event_disconnects, 1)
+
+    async def test_broadcast_classifies_state_events_noncritical_by_default(self):
+        client = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=1,
+            on_event_dropped=self.server._increment_client_event_dropped,
+            on_critical_disconnect=self.server._increment_critical_event_disconnects,
+        )
+        self.server.clients.add(client)
+
+        await self.server.broadcast_event(event_message(1))
+        await self.server.broadcast_event(event_message(2))
+
+        self.assertEqual(self.server.client_event_dropped, 1)
+        self.assertEqual([message["event_id"] for message in queued_payloads(client)], [2])
+        self.assertEqual(self.server.critical_event_disconnects, 0)
+        self.assertTrue(client.is_connected)
+
+    async def test_broadcast_classifies_estop_events_critical_by_default(self):
+        client = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=1,
+            on_event_dropped=self.server._increment_client_event_dropped,
+            on_critical_disconnect=self.server._increment_critical_event_disconnects,
+        )
+        self.server.clients.add(client)
+        await client.send_response(ok_response(1))
+
+        await self.server.broadcast_event(
+            {
+                "type": "event",
+                "event_id": 2,
+                "source": "controller",
+                "event": "estop_triggered",
+                "details": {"origin_board": "motor"},
+            }
+        )
+
+        self.assertEqual(self.server.client_event_dropped, 0)
+        self.assertEqual(self.server.critical_event_disconnects, 1)
+        self.assertFalse(client.is_connected)
+
+    async def test_saturated_critical_disconnect_does_not_affect_other_clients(self):
+        saturated = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=1,
+            on_critical_disconnect=self.server._increment_critical_event_disconnects,
+        )
+        receiving = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=1,
+            on_critical_disconnect=self.server._increment_critical_event_disconnects,
+        )
+        self.server.clients.update({saturated, receiving})
+        await saturated.send_response(ok_response(1))
+
+        event = {
+            "type": "event",
+            "event_id": 2,
+            "source": "controller",
+            "event": "estop_triggered",
+            "details": {"origin_board": "motor"},
+        }
+        await self.server.broadcast_event(event)
+
+        self.assertFalse(saturated.is_connected)
+        self.assertTrue(receiving.is_connected)
+        self.assertEqual([message["event_id"] for message in queued_payloads(receiving)], [2])
+        self.assertEqual(self.server.critical_event_disconnects, 1)
+
+
 class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -75,7 +210,11 @@ class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
         self.board_writer = FakeBoardWriter()
         self.controller.register_board("motor", writer=self.board_writer, schema=schema_for("motor"))
         self.server = LocalUnixSocketServer(socket_path=self.socket_path, controller=self.controller)
-        await self.server.start()
+        try:
+            await self.server.start()
+        except PermissionError as exc:
+            self.tmp.cleanup()
+            raise unittest.SkipTest(f"Unix socket bind unavailable in this environment: {exc}") from exc
 
     async def asyncTearDown(self):
         await self.server.stop()
@@ -293,10 +432,17 @@ class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(client.is_connected)
 
     async def test_critical_backpressure_disconnects_when_only_critical_messages_are_queued(self):
+        disconnects = 0
+
+        def count_disconnect():
+            nonlocal disconnects
+            disconnects += 1
+
         client = LocalClientConnection(
             reader=None,
             writer=FakeLocalWriter(),
             outbound_maxsize=1,
+            on_critical_disconnect=count_disconnect,
         )
 
         self.assertTrue(await client.send_response(ok_response(1)))
@@ -304,6 +450,7 @@ class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(client.connected)
         self.assertTrue(client.writer.closed)
+        self.assertEqual(disconnects, 1)
 
     async def test_estop_reset_routes_to_controller_instead_of_unknown_command(self):
         self.controller.state.system.latch_estop()
