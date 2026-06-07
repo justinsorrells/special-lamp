@@ -636,7 +636,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Make Antigravity (`agy`) audit yield a parseable verdict and relax verdict parsing
+* [x] Task: Make Antigravity (`agy`) audit yield a parseable verdict and relax verdict parsing
 
   ## Goal
 
