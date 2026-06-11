@@ -598,6 +598,28 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(writer.close_count, 1)
         self.assertEqual(controller.pending_count(), 0)
 
+    async def test_shutdown_observability_stop_failure_is_bounded_and_counted(self):
+        class FailingObservability:
+            async def stop(self):
+                raise RuntimeError("redis flush failed")
+
+        controller = ControllerCore(
+            expected_boards={"motor"},
+            observability=FailingObservability(),
+        )
+        writer = self.register_motor(controller)
+        task = asyncio.create_task(controller.route_command(client_command(seq=52)))
+        await self.wait_for_messages(writer, 1)
+
+        await controller.shutdown(drain_timeout_s=0.0, close_timeout_s=0.05)
+        response = await asyncio.wait_for(task, timeout=0.2)
+
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error"]["code"], ErrorCode.CONTROLLER_SHUTDOWN.value)
+        self.assertEqual(controller.metrics_snapshot()["controller_shutdown_failures"], 1)
+        self.assertEqual(controller.pending_count(), 0)
+        self.assertTrue(writer.closed)
+
     async def test_estop_blocks_schema_blocked_commands_but_allows_unblocked(self):
         controller = self.make_controller()
         writer = self.register_motor(controller)

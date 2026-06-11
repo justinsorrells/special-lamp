@@ -4,10 +4,11 @@ import os
 import tempfile
 import unittest
 
-from board_connection import BoardEndpoint, BoardTCPConnection
+from board_connection import BoardEndpoint, BoardTCPConnection, LivenessConfig
 from controller import ControllerCore
 from local_socket import LocalUnixSocketServer
 from protocol import ErrorCode, MessageType
+from state import BoardConnState
 from tests.conftest import (
     client_command,
     encode,
@@ -28,10 +29,18 @@ async def read_raw_json_line(reader, *, timeout=0.8):
 
 
 class FakeLoopBoardServer:
-    def __init__(self, *, board_id="motor", auto_respond=False, close_on_command=False):
+    def __init__(
+        self,
+        *,
+        board_id="motor",
+        auto_respond=False,
+        close_on_command=False,
+        ack_estop=False,
+    ):
         self.board_id = board_id
         self.auto_respond = auto_respond
         self.close_on_command = close_on_command
+        self.ack_estop = ack_estop
         self.server = None
         self.port = None
         self.connections = 0
@@ -58,6 +67,11 @@ class FakeLoopBoardServer:
         writer = self.writers[-1]
         writer.write(encode(message))
         await writer.drain()
+
+    async def close_latest(self):
+        writer = self.writers[-1]
+        writer.close()
+        await writer.wait_closed()
 
     async def _handle(self, reader, writer):
         self.connections += 1
@@ -95,6 +109,19 @@ class FakeLoopBoardServer:
                         await writer.drain()
                 elif message.get("type") == MessageType.ESTOP.value:
                     await self.commands.put(message)
+                    if self.ack_estop:
+                        writer.write(
+                            encode(
+                                {
+                                    "type": "event",
+                                    "source": self.board_id,
+                                    "target": "controller",
+                                    "event": "estop_ack",
+                                    "details": {"state": "safe"},
+                                }
+                            )
+                        )
+                        await writer.drain()
         except ConnectionError:
             return
 
@@ -121,12 +148,15 @@ class LocalLoopIntegrationTests(unittest.IsolatedAsyncioTestCase):
         *,
         auto_respond=False,
         close_on_command=False,
+        ack_estop=False,
         fifo_depth=6,
         default_execution_timeout_s=0.25,
+        liveness_enabled=True,
     ):
         self.board_server = FakeLoopBoardServer(
             auto_respond=auto_respond,
             close_on_command=close_on_command,
+            ack_estop=ack_estop,
         )
         try:
             await self.board_server.start()
@@ -142,6 +172,7 @@ class LocalLoopIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.controller,
             reconnect_delay_s=0.02,
             registration_timeout_s=0.5,
+            liveness=LivenessConfig(enabled=liveness_enabled),
         )
         self.board_connection.start()
         await self.board_connection.wait_registered(timeout=1.0)
@@ -293,6 +324,40 @@ class LocalLoopIntegrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             writer.close()
             await writer.wait_closed()
+
+    async def test_board_estop_trigger_latches_broadcasts_and_tracks_ack(self):
+        await self.start_stack(ack_estop=True, liveness_enabled=False)
+
+        await self.board_server.send_to_latest(
+            {
+                "type": "event",
+                "source": "motor",
+                "target": "controller",
+                "event": "estop_triggered",
+                "details": {"reason": "interlock_gpio"},
+            }
+        )
+        estop = await asyncio.wait_for(self.board_server.commands.get(), timeout=0.8)
+        await self.wait_for(lambda: self.controller.state.boards["motor"].estop_ack)
+
+        self.assertTrue(self.controller.state.system.estop_active)
+        self.assertEqual(estop["type"], MessageType.ESTOP.value)
+        self.assertEqual(estop["source"], "controller")
+        self.assertEqual(estop["target"], "motor")
+        self.assertEqual(self.controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
+
+    async def test_reconnect_during_estop_registers_and_reasserts_estop(self):
+        await self.start_stack(liveness_enabled=False)
+        self.controller.state.system.latch_estop()
+
+        await self.board_server.close_latest()
+        await self.wait_for(lambda: self.board_server.connections >= 2)
+        await self.wait_for(lambda: self.controller.state.boards["motor"].conn_state is BoardConnState.REGISTERED)
+        estop = await asyncio.wait_for(self.board_server.commands.get(), timeout=0.8)
+
+        self.assertTrue(self.controller.state.system.estop_active)
+        self.assertEqual(estop["type"], MessageType.ESTOP.value)
+        self.assertEqual(estop["target"], "motor")
 
     async def wait_for(self, predicate, *, timeout=0.8):
         deadline = asyncio.get_running_loop().time() + timeout

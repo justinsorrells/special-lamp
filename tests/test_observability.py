@@ -139,6 +139,34 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["status"], "ok")
         self.assertGreater(controller.metrics_snapshot()["redis_write_failures"], 0)
 
+    async def test_redis_write_failure_does_not_block_estop_convergence(self):
+        obs = ObservabilityQueue(maxsize=40)
+        redis = FakeRedis(fail=True)
+        worker = RedisTelemetryWorker(redis=redis, obs_queue=obs)
+        worker.start()
+        controller = ControllerCore(expected_boards={"motor"}, observability=obs)
+        writer = FakeBoardWriter()
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+
+        in_flight = asyncio.create_task(controller.route_command(client_command(seq=111)))
+        await self.wait_for(lambda: len(writer.messages) == 1)
+        queued = asyncio.create_task(controller.route_command(client_command(seq=112)))
+        await self.wait_for(lambda: controller.fifo_depth_for("motor") == 1)
+
+        await controller.trigger_estop(origin_board="motor")
+        queued_response = await asyncio.wait_for(queued, timeout=0.5)
+        await self.wait_for(lambda: obs.counters.redis_write_failures > 0)
+        await controller.handle_board_response(board_ok_response(writer.messages[0]["seq"]))
+        in_flight_response = await asyncio.wait_for(in_flight, timeout=0.5)
+        await worker.stop()
+
+        self.assertTrue(controller.state.system.estop_active)
+        self.assertEqual(writer.messages[1]["type"], MessageType.ESTOP.value)
+        self.assertEqual(queued_response["status"], "error")
+        self.assertEqual(queued_response["error"]["code"], ErrorCode.ESTOP_ACTIVE.value)
+        self.assertEqual(in_flight_response["status"], "ok")
+        self.assertGreater(controller.metrics_snapshot()["redis_write_failures"], 0)
+
     async def test_worker_handles_redis_write_exceptions_without_crashing(self):
         obs = ObservabilityQueue(maxsize=10)
         redis = FakeRedis(fail=True)
