@@ -39,6 +39,7 @@ GUI / local client            board/controller events
 | `demos/` | Mock board server, mock client, and a status webapp |
 | `tools/check_invariants.py` | Static architecture-invariant checker |
 | `docs/contracts/` | **Frozen** networking + firmware contracts (source of truth) |
+| `docs/companion/` | Subordinate implementation handoffs, integration guide, and test matrix |
 | `.agents/skills/` | Per-area execution rules for agents |
 
 ## Setup
