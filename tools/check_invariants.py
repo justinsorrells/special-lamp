@@ -85,6 +85,27 @@ AGENTS_MD = "AGENTS.md"
 # (e.g. time.monotonic for clocks) -- only the blocking sleep is forbidden.
 BLOCKING_IMPORT_NAMES = frozenset({"requests"})
 
+# Repo hygiene: the frozen contract belongs under docs/contracts/. A legacy root
+# file is allowed only as a one-line pointer so agents do not read a stale copy.
+CANONICAL_NETWORKING_CONTRACT = "docs/contracts/V1_Networking_Decisions.md"
+ROOT_NETWORKING_CONTRACT_POINTER = (
+    "See docs/contracts/V1_Networking_Decisions.md for the authoritative frozen networking contract.\n"
+)
+ROOT_NETWORKING_CONTRACT = "V1_Networking_Decisions.md"
+
+# Top-level Markdown should be stable project entry points only. Agent review /
+# audit / brief files belong under `.agent_runs/` or `docs/`, not in the root
+# where they look like maintained project guidance.
+ALLOWED_TOP_LEVEL_MARKDOWN = frozenset(
+    {
+        "AGENTS.md",
+        "CLAUDE.md",
+        "README.md",
+        "backlog.md",
+        ROOT_NETWORKING_CONTRACT,
+    }
+)
+
 
 @dataclass(frozen=True)
 class Violation:
@@ -355,6 +376,53 @@ def check_no_blocking_calls_in_command_path(root: Path = REPO_ROOT) -> list[Viol
     return violations
 
 
+def check_no_root_contract_duplicate(root: Path = REPO_ROOT) -> list[Violation]:
+    """The root networking contract file must be absent or a pointer only."""
+
+    root_contract = root / ROOT_NETWORKING_CONTRACT
+    if not root_contract.exists():
+        return []
+
+    text = root_contract.read_text(encoding="utf-8")
+    if text == ROOT_NETWORKING_CONTRACT_POINTER:
+        return []
+
+    canonical = root / CANONICAL_NETWORKING_CONTRACT
+    if not canonical.exists():
+        detail = (
+            f"root contract file exists, but canonical {CANONICAL_NETWORKING_CONTRACT!r} is missing; "
+            "keep only the canonical contract plus an optional one-line pointer"
+        )
+    elif text == canonical.read_text(encoding="utf-8"):
+        detail = (
+            f"duplicates {CANONICAL_NETWORKING_CONTRACT}; replace it with the one-line pointer or remove it"
+        )
+    else:
+        detail = (
+            f"diverges from {CANONICAL_NETWORKING_CONTRACT}; replace it with the one-line pointer or remove it"
+        )
+    return [Violation("repo-hygiene", ROOT_NETWORKING_CONTRACT, detail)]
+
+
+def check_top_level_markdown_files(root: Path = REPO_ROOT) -> list[Violation]:
+    """Reject stray root Markdown files such as review/audit/brief artifacts."""
+
+    violations: list[Violation] = []
+    for path in sorted(root.glob("*.md")):
+        name = path.name
+        if name in ALLOWED_TOP_LEVEL_MARKDOWN:
+            continue
+        violations.append(
+            Violation(
+                "repo-hygiene",
+                name,
+                "stray top-level Markdown file; move review/brief artifacts under .agent_runs/ "
+                "or maintained docs under docs/",
+            )
+        )
+    return violations
+
+
 def run_all_checks(root: Path = REPO_ROOT) -> list[Violation]:
     """Run every invariant check and return all violations."""
 
@@ -364,6 +432,8 @@ def run_all_checks(root: Path = REPO_ROOT) -> list[Violation]:
     violations.extend(check_client_modules_isolated(root))
     violations.extend(check_error_codes_match_contract(root))
     violations.extend(check_no_blocking_calls_in_command_path(root))
+    violations.extend(check_no_root_contract_duplicate(root))
+    violations.extend(check_top_level_markdown_files(root))
     return violations
 
 

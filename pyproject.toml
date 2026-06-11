@@ -18,6 +18,9 @@ select = ["E", "F", "I", "UP", "B"]
 # that is stylistic, not a correctness gain, so the existing TypeVar form stays.
 ignore = ["UP047"]
 
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
 [tool.mypy]
 python_version = "3.13"  # mypy target; runtime is 3.14
 warn_unused_ignores = true

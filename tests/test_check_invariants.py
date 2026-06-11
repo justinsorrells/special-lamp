@@ -19,7 +19,9 @@ from tools.check_invariants import (
     check_core_command_path_imports,
     check_error_codes_match_contract,
     check_no_blocking_calls_in_command_path,
+    check_no_root_contract_duplicate,
     check_terminal_statuses_frozen,
+    check_top_level_markdown_files,
     run_all_checks,
 )
 
@@ -38,6 +40,9 @@ _AGENTS_TWO_CODES = (
     "```text\n"
     "INVALID_JSON  BOARD_BUSY\n"
     "```\n"
+)
+_ROOT_CONTRACT_POINTER = (
+    "See docs/contracts/V1_Networking_Decisions.md for the authoritative frozen networking contract.\n"
 )
 
 
@@ -232,6 +237,50 @@ class SyntheticViolationTests(unittest.TestCase):
         # `import time` for a non-blocking clock must not be flagged.
         self._write("controller.py", "import time\n\ndef now():\n    return time.monotonic()\n")
         self.assertEqual(check_no_blocking_calls_in_command_path(self.root), [])
+
+    # --- repo hygiene ------------------------------------------------------
+
+    def test_absent_root_contract_file_passes(self):
+        self._write("docs/contracts/V1_Networking_Decisions.md", "# canonical\n")
+        self.assertEqual(check_no_root_contract_duplicate(self.root), [])
+
+    def test_root_contract_pointer_passes(self):
+        self._write("docs/contracts/V1_Networking_Decisions.md", "# canonical\n")
+        self._write("V1_Networking_Decisions.md", _ROOT_CONTRACT_POINTER)
+        self.assertEqual(check_no_root_contract_duplicate(self.root), [])
+
+    def test_divergent_root_contract_duplicate_is_flagged(self):
+        self._write("docs/contracts/V1_Networking_Decisions.md", "# canonical\n")
+        self._write("V1_Networking_Decisions.md", "# stale divergent copy\n")
+        violations = check_no_root_contract_duplicate(self.root)
+        self.assertTrue(violations)
+        self.assertIn("diverges", str(violations[0]))
+        self.assertIn("docs/contracts/V1_Networking_Decisions.md", str(violations[0]))
+
+    def test_identical_root_contract_duplicate_is_flagged(self):
+        self._write("docs/contracts/V1_Networking_Decisions.md", "# canonical\n")
+        self._write("V1_Networking_Decisions.md", "# canonical\n")
+        violations = check_no_root_contract_duplicate(self.root)
+        self.assertTrue(violations)
+        self.assertIn("duplicates", str(violations[0]))
+
+    def test_stray_top_level_review_markdown_is_flagged(self):
+        self._write("review.md", "# temporary review\n")
+        violations = check_top_level_markdown_files(self.root)
+        self.assertTrue(violations)
+        self.assertIn("review.md", str(violations[0]))
+        self.assertIn("stray top-level Markdown", str(violations[0]))
+
+    def test_stray_top_level_brief_markdown_is_flagged(self):
+        self._write("implementation_brief.md", "# brief\n")
+        violations = check_top_level_markdown_files(self.root)
+        self.assertTrue(violations)
+        self.assertIn("implementation_brief.md", str(violations[0]))
+
+    def test_allowed_top_level_markdown_passes(self):
+        for name in ("AGENTS.md", "CLAUDE.md", "README.md", "backlog.md", "V1_Networking_Decisions.md"):
+            self._write(name, "# allowed\n")
+        self.assertEqual(check_top_level_markdown_files(self.root), [])
 
 
 if __name__ == "__main__":
