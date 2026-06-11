@@ -1,213 +1,207 @@
+"""Persistent Unix-socket demo client for the v1 controller."""
+
+from __future__ import annotations
+
+import argparse
 import asyncio
-from collections import deque
-from enum import Enum
-import json
-import os
-import socket
-import struct
-import time
+import logging
+from dataclasses import dataclass, field
+from typing import Any
 
-SOCKET_PATH = "/tmp/chudmail"
+from protocol import CONTROLLER_MAX_LINE_BYTES, MessageType, parse_message, serialize_message
 
-
-class Status(Enum):
-    """
-    ENUM for UDPClient connection statuses
-    """
-
-    CONNECTED = "connected"
-    DISCONNECTED = "disconnected"
+LOGGER = logging.getLogger(__name__)
+DEFAULT_SOCKET_PATH = "/tmp/hyperloop-controller.sock"
+DEFAULT_CLIENT_SEQ = 1000
 
 
-class UDPClient:
-    """
-    UDPClient class for persistent connection with UDP server.
-    """
+@dataclass
+class UnixSocketDemoClient:
+    socket_path: str = DEFAULT_SOCKET_PATH
+    source: str = "demo_client"
+    reader: asyncio.StreamReader | None = None
+    writer: asyncio.StreamWriter | None = None
+    next_seq: int = DEFAULT_CLIENT_SEQ
+    inbound: asyncio.Queue[dict[str, Any]] = field(default_factory=asyncio.Queue)
+    _reader_task: asyncio.Task[None] | None = None
 
-    def __init__(self, addr):
-        self.addr = addr  # (HOSTNAME, PORT)
-        self.args = None
-        self.cmd = None
-        self.dropped = 0
-        self.hostname = None
-        self.last_ack = 0
-        self.output = None  # dict[str, Any]
-        self.packetsize = 1024
-        self.schema = None
-        self.sequence_no = 0
-        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.socket.setblocking(False)
-        self.status = Status.DISCONNECTED
-        self.threshold = 5.0
-        self.timestamp = time.monotonic()
-        self.queue = deque()
-
-    async def _connect(self):
-        """
-        Verify connection to server and update schema.
-        """
-        packet = {
-            "type": "command",
-            "sequence_no": self.sequence_no,
-            "timestamp": time.monotonic(),
-            "cmd": "info",
-            "args": [],
-        }
-        await self._send(self._encode(packet))
-        try:
-            data, addr = await self._receive()
-        except asyncio.TimeoutError:
-            print(f"packet_no: {self.sequence_no} timed out")
-            self.dropped += 1
-            return None
-        data = self._decode(data)
-        if data.get("status_code") == 200:
-            self.last_ack = data["sequence_no"]
-            self.schema = data.get("result", {}).get("functions", None)
-            self.status = Status.CONNECTED
-            self.timestamp = data["timestamp"]
-
-    def _decode(self, packet):
-        return json.loads(packet.decode("utf-8"))
-
-    def _encode(self, packet):
-        return json.dumps(packet).encode("utf-8")
-
-    def _next_sequence_no(self):
-        self.sequence_no += 1
-        return self.sequence_no
-
-    async def _receive(self, timeout=0.5):
-        loop = asyncio.get_running_loop()
-        return await asyncio.wait_for(
-            loop.sock_recvfrom(self.socket, self.packetsize),
-            timeout=timeout,
+    async def connect(self) -> None:
+        if self.reader is not None or self.writer is not None:
+            return
+        self.reader, self.writer = await asyncio.open_unix_connection(
+            self.socket_path,
+            limit=CONTROLLER_MAX_LINE_BYTES,
         )
+        self._reader_task = asyncio.create_task(self._read_loop())
 
-    async def _send(self, packet):
-        loop = asyncio.get_running_loop()
-        try:
-            await loop.sock_sendto(self.socket, packet, self.addr)
-        except Exception:
-            print(f"send to {self.addr} failed...")
+    async def close(self) -> None:
+        if self._reader_task is not None:
+            self._reader_task.cancel()
+            try:
+                await self._reader_task
+            except asyncio.CancelledError:
+                pass
+            self._reader_task = None
+        if self.writer is not None:
+            self.writer.close()
+            await self.writer.wait_closed()
+        self.reader = None
+        self.writer = None
 
-    def enqueue_command(self, packet):
-        self.queue.append(packet)
+    async def send_command(
+        self,
+        *,
+        target: str,
+        command: str,
+        args: dict[str, Any] | None = None,
+        seq: int | None = None,
+    ) -> int:
+        if seq is None:
+            seq = self._next_seq()
+        await self._send(
+            {
+                "type": MessageType.COMMAND.value,
+                "seq": seq,
+                "source": self.source,
+                "target": target,
+                "command": command,
+                "args": {} if args is None else args,
+            }
+        )
+        return seq
 
-    async def send_command(self, timeout=0.5):
-        self.set_command()
-        if time.monotonic() - self.timestamp > self.threshold or self.schema is None:
-            self.status = Status.DISCONNECTED
-        if self.status == Status.DISCONNECTED:
-            await self._connect()
+    async def send_estop_reset(self, *, seq: int | None = None) -> int:
+        if seq is None:
+            seq = self._next_seq()
+        await self._send(
+            {
+                "type": MessageType.ESTOP_RESET.value,
+                "seq": seq,
+                "source": self.source,
+                "target": "controller",
+            }
+        )
+        return seq
+
+    async def read_message(self, *, timeout_s: float | None = None) -> dict[str, Any]:
+        if timeout_s is None:
+            return await self.inbound.get()
+        return await asyncio.wait_for(self.inbound.get(), timeout=timeout_s)
+
+    async def read_response(self, seq: int, *, timeout_s: float = 2.0) -> dict[str, Any]:
+        deadline = asyncio.get_running_loop().time() + timeout_s
+        while True:
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                raise TimeoutError(f"no response for seq {seq}")
+            message = await self.read_message(timeout_s=remaining)
+            if message.get("type") == MessageType.RESPONSE.value and message.get("seq") == seq:
+                return message
+            LOGGER.info("event: %s", message)
+
+    async def _send(self, message: dict[str, Any]) -> None:
+        if self.writer is None:
+            raise RuntimeError("client is not connected")
+        self.writer.write(serialize_message(message, max_line_bytes=CONTROLLER_MAX_LINE_BYTES))
+        await self.writer.drain()
+
+    async def _read_loop(self) -> None:
+        if self.reader is None:
             return
-        seq = self._next_sequence_no()
-        packet = {
-            "type": "command",
-            "sequence_no": seq,
-            "timestamp": time.monotonic(),
-            "cmd": self.cmd,
-            "args": self.args,
-        }
-        await self._send(self._encode(packet))
         try:
-            data, addr = await self._receive(timeout)
-        except asyncio.TimeoutError:
-            print(f"packet_no: {seq} timed out")
-            self.dropped += 1
-            return None
-        data = self._decode(data)
-        if data["sequence_no"] > self.last_ack:
-            self.last_ack = data["sequence_no"]
-            self.output = data
-            self.timestamp = data["timestamp"]
-        return self.output
-
-    def set_command(self):
-        if len(self.queue) <= 0:
-            self.cmd = "info"
-            self.args = []
+            while True:
+                line = await self.reader.readuntil(b"\n")
+                parsed = parse_message(line, max_line_bytes=CONTROLLER_MAX_LINE_BYTES)
+                if parsed.ok:
+                    await self.inbound.put(parsed.message)
+                else:
+                    LOGGER.warning("discarded malformed controller message: %s", parsed.error)
+        except asyncio.IncompleteReadError:
             return
-        cmd, args = self.queue.popleft()
-        self.cmd = cmd
-        self.args = args
+        except asyncio.CancelledError:
+            raise
+
+    def _next_seq(self) -> int:
+        seq = self.next_seq
+        self.next_seq += 1
+        return seq
 
 
-def get_info(clients):
-    res = {}
-    for client in clients.values():
-        res[client.hostname] = client.schema
-    return res
+def _parse_args(raw_args: list[str]) -> dict[str, Any]:
+    if not raw_args:
+        return {}
+    result: dict[str, Any] = {}
+    for item in raw_args:
+        name, _, value = item.partition("=")
+        if not name or not _:
+            raise ValueError(f"argument {item!r} must use name=value")
+        result[name] = _coerce_value(value)
+    return result
 
 
-async def handle_command(reader, writer, clients):
+def _coerce_value(value: str) -> int | float | bool | str:
+    if value == "true":
+        return True
+    if value == "false":
+        return False
     try:
-        data = await reader.readline()
-        if not data:
-            return
-        message = json.loads(data.decode("utf-8"))
-        client_id = int(message["client"])
-        cmd = message["cmd"]
-        args = message.get("args", [])
-        if cmd == "boards":
-            response = get_info(clients)
-        elif client_id in clients:
-            clients[client_id].enqueue_command((cmd, args))
-            response = {"status": "accepted"}
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+async def run_once(args: argparse.Namespace) -> dict[str, Any]:
+    client = UnixSocketDemoClient(socket_path=args.socket_path, source=args.source)
+    await client.connect()
+    try:
+        if args.estop_reset:
+            seq = await client.send_estop_reset()
         else:
-            response = {"status": "rejected", "reason": "unknown client"}
-        writer.write((json.dumps(response) + "\n").encode("utf-8"))
-        await writer.drain()
-    except Exception as e:
-        response = {"status": "error", "reason": str(e)}
-        writer.write((json.dumps(response) + "\n").encode("utf-8"))
-        await writer.drain()
+            seq = await client.send_command(
+                target=args.target,
+                command=args.command,
+                args=_parse_args(args.args),
+            )
+        return await client.read_response(seq, timeout_s=args.timeout_s)
     finally:
-        writer.close()
-        await writer.wait_closed()
+        await client.close()
 
 
-async def command_updater(clients, stop):
-    if os.path.exists(SOCKET_PATH):
-        os.remove(SOCKET_PATH)
-
-    server = await asyncio.start_unix_server(
-        lambda reader, writer: handle_command(reader, writer, clients),
-        path=SOCKET_PATH,
-    )
-
-    async with server:
-        while not stop.is_set():
-            await asyncio.sleep(0.1)
-
-    server.close()
-    await server.wait_closed()
+async def watch_events(args: argparse.Namespace) -> None:
+    client = UnixSocketDemoClient(socket_path=args.socket_path, source=args.source)
+    await client.connect()
+    try:
+        while True:
+            print(await client.read_message())
+    finally:
+        await client.close()
 
 
-async def flood(client, stop, hz=50):
-    interval = 1.0 / hz
-    while not stop.is_set():
-        res = await client.send_command(timeout=0.02)
-        print(f"{client.hostname}: {res}")
-        await asyncio.sleep(interval)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Send v1 messages to the controller Unix socket")
+    parser.add_argument("--socket-path", default=DEFAULT_SOCKET_PATH)
+    parser.add_argument("--source", default="demo_client")
+    parser.add_argument("--target", default="motor")
+    parser.add_argument("--command", default="status")
+    parser.add_argument("--timeout-s", type=float, default=2.0)
+    parser.add_argument("--estop-reset", action="store_true")
+    parser.add_argument("--watch", action="store_true", help="print all responses/events until interrupted")
+    parser.add_argument("args", nargs="*", help="command args as name=value")
+    return parser
 
 
-async def main():
-    start = time.monotonic()
-    stop = asyncio.Event()
-    clients = {
-        1: UDPClient(("127.0.0.1", 6767)),
-    }
-    for idx, client in enumerate(clients.values()):
-        client.enqueue_command(("info", []))
-        client.hostname = idx + 1
-
-    await asyncio.gather(
-        *(flood(client, stop, hz=1) for client in clients.values()),
-        command_updater(clients, stop),
-    )
-    print(time.monotonic() - start)
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    args = build_parser().parse_args()
+    if args.watch:
+        asyncio.run(watch_events(args))
+        return
+    print(asyncio.run(run_once(args)))
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
