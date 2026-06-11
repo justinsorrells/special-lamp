@@ -813,7 +813,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Replace legacy UDP demos with a contract-faithful TCP mock board and Unix-socket client
+* [x] Task: Replace legacy UDP demos with a contract-faithful TCP mock board and Unix-socket client
 
   ## Goal
 
