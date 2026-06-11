@@ -850,7 +850,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Add e-stop and lifecycle integration proof tests (contract 1.7, 1.13, 6.9)
+* [x] Task: Add e-stop and lifecycle integration proof tests (contract 1.7, 1.13, 6.9)
 
   ## Goal
 
