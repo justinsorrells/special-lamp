@@ -100,6 +100,7 @@ class LocalSocketBackpressureTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.server.client_event_dropped, 1)
         self.assertEqual(self.controller.metrics_snapshot()["local_event_dropped"], 1)
+        self.assertEqual(self.controller.metrics_snapshot()["client_event_dropped"], 1)
         self.assertEqual([message["event_id"] for message in queued_payloads(client)], [2, 3])
         self.assertTrue(client.is_connected)
 

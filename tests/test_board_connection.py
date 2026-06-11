@@ -35,6 +35,7 @@ class FakeBoardTCPServer:
         self.readers = []
         self.send_malformed_before_schema = False
         self.close_after_schema = False
+        self.suppress_schema = False
         self.auto_respond = False
         self.ack_heartbeats = False
 
@@ -71,6 +72,9 @@ class FakeBoardTCPServer:
         self.connections += 1
         self.readers.append(reader)
         self.writers.append(writer)
+        if self.suppress_schema:
+            await reader.read()
+            return
         if self.send_malformed_before_schema:
             writer.write(b"not-json\n")
             await writer.drain()
@@ -119,7 +123,7 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.connection = BoardTCPConnection(
             BoardEndpoint("motor", "127.0.0.1", self.server.port),
             self.controller,
-            reconnect_delay_s=0.02,
+            reconnect_backoff=ReconnectBackoff(base_delay_s=0.02, random_fraction=lambda: 1.0),
             liveness=LivenessConfig(enabled=False),
         )
 
@@ -202,6 +206,7 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
         self.assertGreaterEqual(self.server.connections, 2)
+        self.assertGreaterEqual(self.controller.metrics_snapshot()["reconnect_count"], 1)
 
     async def test_late_response_after_timeout_is_dropped_through_core(self):
         self.start_connection()
@@ -417,6 +422,25 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
         self.assertGreaterEqual(self.server.connections, 2)
+
+    async def test_registration_timeout_counter_increments(self):
+        await self.connection.stop()
+        self.server.suppress_schema = True
+        self.connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", self.server.port),
+            self.controller,
+            reconnect_backoff=ReconnectBackoff(base_delay_s=0.01, random_fraction=lambda: 1.0),
+            registration_timeout_s=0.01,
+            liveness=LivenessConfig(enabled=False),
+        )
+
+        self.start_connection()
+        await self.wait_for(
+            lambda: self.controller.metrics_snapshot()["registration_timeouts"] >= 1,
+            timeout=0.5,
+        )
+
+        self.assertEqual(self.controller.state.boards["motor"].conn_state, BoardConnState.FAULTED)
 
 
 class ReconnectBackoffTests(unittest.TestCase):

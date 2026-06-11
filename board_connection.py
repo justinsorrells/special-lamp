@@ -192,6 +192,7 @@ class BoardTCPConnection:
                 await self._wait_before_reconnect()
 
     async def _wait_before_reconnect(self) -> None:
+        self.controller.record_reconnect_attempt()
         delay_s = self.reconnect_backoff.next_delay_s()
         try:
             await asyncio.wait_for(self._stop.wait(), timeout=delay_s)
@@ -215,10 +216,15 @@ class BoardTCPConnection:
             stream_writer = StreamBoardWriter(self.endpoint.board_id, raw_writer)
             self._stream_writer = stream_writer
 
-            schema = await asyncio.wait_for(
-                self._read_valid_message(reader),
-                timeout=self.registration_timeout_s,
-            )
+            try:
+                schema = await asyncio.wait_for(
+                    self._read_valid_message(reader),
+                    timeout=self.registration_timeout_s,
+                )
+            except TimeoutError:
+                self.controller.record_registration_timeout()
+                self.controller.set_board_state(self.endpoint.board_id, BoardConnState.FAULTED)
+                return
             if schema is None or schema.get("type") != MessageType.SCHEMA.value:
                 self.controller.set_board_state(self.endpoint.board_id, BoardConnState.FAULTED)
                 return
@@ -244,7 +250,6 @@ class BoardTCPConnection:
 
             await self._read_loop(reader)
         except (TimeoutError, ConnectionError, OSError):
-            # Future metrics hook: distinguish registration_timeouts from connect/read failures.
             self.controller.set_board_state(self.endpoint.board_id, BoardConnState.FAULTED)
         finally:
             await self._stop_heartbeat()

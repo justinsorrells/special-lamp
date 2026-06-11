@@ -7,6 +7,8 @@ not implement sockets, Redis access, firmware behavior, or GUI integration.
 from __future__ import annotations
 
 import asyncio
+import math
+from collections import deque
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -16,6 +18,7 @@ DEFAULT_COMMAND_TIMEOUT_S = 2.0
 MAX_COMMAND_TIMEOUT_S = 10.0
 DEFAULT_QUEUE_RESIDENCY_CAP_S = 10.0
 DEFAULT_BOARD_LIVENESS_TIMEOUT_S = 0.25
+DEFAULT_LATENCY_SAMPLE_WINDOW = 1024
 
 
 class BoardConnState(StrEnum):
@@ -33,6 +36,37 @@ class CommandLatencyObservation:
     controller_ts: float
     observed_at: float
     board_proc_us: float | None = None
+
+
+@dataclass
+class LatencyPercentileObservation:
+    sample_count: int = 0
+    samples: deque[float] = field(
+        default_factory=lambda: deque(maxlen=DEFAULT_LATENCY_SAMPLE_WINDOW)
+    )
+
+    def observe(self, latency_ms: float) -> None:
+        self.sample_count += 1
+        self.samples.append(max(0.0, latency_ms))
+
+    def percentile(self, percentile: float) -> float | None:
+        if not self.samples:
+            return None
+        if percentile < 0 or percentile > 100:
+            raise ValueError("percentile must be from 0 to 100")
+        ordered = sorted(self.samples)
+        if percentile == 0:
+            return ordered[0]
+        index = math.ceil(len(ordered) * percentile / 100)
+        return ordered[min(len(ordered) - 1, index - 1)]
+
+    def as_metrics(self, *, prefix: str = "command_latency") -> dict[str, float | int | None]:
+        return {
+            f"{prefix}_sample_count": self.sample_count,
+            f"{prefix}_p50_ms": self.percentile(50),
+            f"{prefix}_p95_ms": self.percentile(95),
+            f"{prefix}_p99_ms": self.percentile(99),
+        }
 
 
 @dataclass
@@ -96,6 +130,9 @@ class BoardState:
     in_flight_board_seq: int | None = None
     schema: dict[str, Any] | None = None
     last_command_latency: CommandLatencyObservation | None = None
+    command_latency_percentiles: LatencyPercentileObservation = field(
+        default_factory=LatencyPercentileObservation
+    )
     telemetry_rate: TelemetryRateObservation = field(default_factory=TelemetryRateObservation)
 
     def mark_estop_sent(self) -> None:
@@ -167,6 +204,10 @@ class BoardStateRecord:
     in_flight_board_seq: int | None = None
     last_command_latency_ms: float | None = None
     last_board_proc_us: float | None = None
+    command_latency_sample_count: int = 0
+    command_latency_p50_ms: float | None = None
+    command_latency_p95_ms: float | None = None
+    command_latency_p99_ms: float | None = None
     telemetry_rate_hz: float | None = None
     telemetry_jitter_ms: float | None = None
     telemetry_interval_ms: float | None = None
@@ -193,6 +234,10 @@ class BoardStateRecord:
             last_board_proc_us=(
                 None if state.last_command_latency is None else state.last_command_latency.board_proc_us
             ),
+            command_latency_sample_count=state.command_latency_percentiles.sample_count,
+            command_latency_p50_ms=state.command_latency_percentiles.percentile(50),
+            command_latency_p95_ms=state.command_latency_percentiles.percentile(95),
+            command_latency_p99_ms=state.command_latency_percentiles.percentile(99),
             telemetry_rate_hz=state.telemetry_rate.rate_hz,
             telemetry_jitter_ms=state.telemetry_rate.jitter_ms,
             telemetry_interval_ms=state.telemetry_rate.last_interval_ms,
@@ -215,6 +260,10 @@ class BoardStateRecord:
             "in_flight_board_seq": self.in_flight_board_seq,
             "last_command_latency_ms": self.last_command_latency_ms,
             "last_board_proc_us": self.last_board_proc_us,
+            "command_latency_sample_count": self.command_latency_sample_count,
+            "command_latency_p50_ms": self.command_latency_p50_ms,
+            "command_latency_p95_ms": self.command_latency_p95_ms,
+            "command_latency_p99_ms": self.command_latency_p99_ms,
             "telemetry_rate_hz": self.telemetry_rate_hz,
             "telemetry_jitter_ms": self.telemetry_jitter_ms,
             "telemetry_interval_ms": self.telemetry_interval_ms,

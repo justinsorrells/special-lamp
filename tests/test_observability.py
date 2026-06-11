@@ -304,6 +304,10 @@ class ObservabilityTests(unittest.IsolatedAsyncioTestCase):
         latest_state = board_states[-1]["hash"]
         self.assertIsInstance(latest_state["last_command_latency_ms"], float)
         self.assertEqual(latest_state["last_board_proc_us"], 1200.0)
+        self.assertEqual(latest_state["command_latency_sample_count"], 1)
+        self.assertIsInstance(latest_state["command_latency_p50_ms"], float)
+        self.assertIsInstance(latest_state["command_latency_p95_ms"], float)
+        self.assertIsInstance(latest_state["command_latency_p99_ms"], float)
         self.assertEqual(latest_state["telemetry_sample_count"], 2)
         self.assertIn("telemetry_rate_hz", latest_state)
         self.assertIn("telemetry_jitter_ms", latest_state)

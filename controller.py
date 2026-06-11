@@ -35,6 +35,7 @@ from state import (
     BoardState,
     CommandLatencyObservation,
     ControllerState,
+    LatencyPercentileObservation,
     PendingCommand,
 )
 
@@ -64,6 +65,10 @@ class ControllerCounters:
     commands_completed_error: int = 0
     commands_completed_timeout: int = 0
     stale_command_rejections: int = 0
+    reconnect_count: int = 0
+    registration_timeouts: int = 0
+    protocol_version_mismatches: int = 0
+    client_event_dropped: int = 0
     heartbeat_acks_missed: int = 0
     malformed_heartbeat_acks: int = 0
     late_heartbeat_acks: int = 0
@@ -136,6 +141,7 @@ class ControllerCore:
         self._timeout_tasks: dict[int, asyncio.Task[None]] = {}
         self._resolved_board_seqs: dict[int, str] = {}
         self._resolved_board_seq_order: deque[int] = deque(maxlen=4096)
+        self._command_latency_percentiles = LatencyPercentileObservation()
         self._shutdown_task: asyncio.Task[None] | None = None
         self._shutting_down = False
 
@@ -152,6 +158,7 @@ class ControllerCore:
         try:
             check_protocol_version(schema)
         except ProtocolValidationError:
+            self.counters.increment("protocol_version_mismatches")
             runtime.state.conn_state = BoardConnState.FAULTED
             self.state.refresh_connected_count()
             raise
@@ -327,6 +334,8 @@ class ControllerCore:
                 observed_at=observed_at,
                 board_proc_us=board_proc_us,
             )
+            runtime.state.command_latency_percentiles.observe(latency_ms)
+            self._command_latency_percentiles.observe(latency_ms)
             self._observe_board_state(runtime.state)
         client_response = build_client_response(
             response,
@@ -606,8 +615,8 @@ class ControllerCore:
             return len(self._pending)
         return sum(1 for entry in self._pending.values() if entry.board_id == board_id)
 
-    def metrics_snapshot(self) -> dict[str, int]:
-        snapshot = self.counters.snapshot()
+    def metrics_snapshot(self) -> dict[str, Any]:
+        snapshot: dict[str, Any] = self.counters.snapshot()
         obs_counters = getattr(self.observability, "counters", None)
         if obs_counters is not None:
             snapshot["obs_dropped"] = getattr(obs_counters, "obs_dropped", snapshot["obs_dropped"])
@@ -616,6 +625,11 @@ class ControllerCore:
                 "redis_write_failures",
                 snapshot["redis_write_failures"],
             )
+        snapshot.update(self._command_latency_percentiles.as_metrics())
+        snapshot["boards"] = {
+            board_id: self._board_metrics_snapshot(runtime.state)
+            for board_id, runtime in self._boards.items()
+        }
         return dict(snapshot)
 
     def record_orphaned_response(self) -> None:
@@ -632,6 +646,13 @@ class ControllerCore:
 
     def record_local_event_dropped(self) -> None:
         self.counters.increment("local_event_dropped")
+        self.counters.increment("client_event_dropped")
+
+    def record_reconnect_attempt(self) -> None:
+        self.counters.increment("reconnect_count")
+
+    def record_registration_timeout(self) -> None:
+        self.counters.increment("registration_timeouts")
 
     def record_critical_event_disconnect(self) -> None:
         self.counters.increment("critical_event_disconnects")
@@ -894,6 +915,20 @@ class ControllerCore:
 
     def _record_terminal_response(self, response: dict[str, Any]) -> None:
         self.counters.record_terminal_response(response)
+
+    def _board_metrics_snapshot(self, state: BoardState) -> dict[str, Any]:
+        latency = state.command_latency_percentiles.as_metrics()
+        return {
+            "conn_state": state.conn_state.value,
+            "estop_ack": state.estop_ack,
+            "queue_depth": state.queue_depth,
+            "in_flight_board_seq": state.in_flight_board_seq,
+            "telemetry_rate_hz": state.telemetry_rate.rate_hz,
+            "telemetry_jitter_ms": state.telemetry_rate.jitter_ms,
+            "telemetry_interval_ms": state.telemetry_rate.last_interval_ms,
+            "telemetry_sample_count": state.telemetry_rate.sample_count,
+            **latency,
+        }
 
     def _remember_terminal_board_seq(self, board_seq: int | None, status: str) -> None:
         if board_seq is None:

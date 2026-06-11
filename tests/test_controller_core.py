@@ -75,14 +75,43 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
             "commands_completed_error",
             "commands_completed_timeout",
             "stale_command_rejections",
+            "reconnect_count",
+            "registration_timeouts",
+            "protocol_version_mismatches",
+            "client_event_dropped",
             "heartbeat_acks_missed",
             "malformed_heartbeat_acks",
             "late_heartbeat_acks",
             "telemetry_liveness_timeouts",
+            "command_latency_sample_count",
+            "command_latency_p50_ms",
+            "command_latency_p95_ms",
+            "command_latency_p99_ms",
+            "boards",
         }
 
         self.assertEqual(set(snapshot), expected_counters)
-        self.assertTrue(all(value == 0 for value in snapshot.values()))
+        numeric_values = {key: value for key, value in snapshot.items() if key != "boards"}
+        self.assertTrue(
+            all(value in {0, None} for value in numeric_values.values())
+        )
+        self.assertEqual(
+            snapshot["boards"]["motor"],
+            {
+                "conn_state": BoardConnState.DISCONNECTED.value,
+                "estop_ack": False,
+                "queue_depth": 0,
+                "in_flight_board_seq": None,
+                "telemetry_rate_hz": None,
+                "telemetry_jitter_ms": None,
+                "telemetry_interval_ms": None,
+                "telemetry_sample_count": 0,
+                "command_latency_sample_count": 0,
+                "command_latency_p50_ms": None,
+                "command_latency_p95_ms": None,
+                "command_latency_p99_ms": None,
+            },
+        )
         snapshot["unmatched_seq"] = 99
         self.assertEqual(controller.metrics_snapshot()["unmatched_seq"], 0)
 
@@ -279,7 +308,33 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
             controller.register_board("motor", writer=writer, schema=bad_schema)
 
         self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.FAULTED)
+        self.assertEqual(controller.metrics_snapshot()["protocol_version_mismatches"], 1)
         self.assertEqual(writer.messages, [])
+
+    async def test_metrics_record_latency_percentiles_from_monotonic_samples(self):
+        clock = FakeClock(1000.0)
+        controller = self.make_controller(monotonic_clock=clock)
+        writer = self.register_motor(controller)
+
+        for seq, latency_s in enumerate((0.01, 0.02, 0.03, 0.04, 0.10), start=1):
+            task = asyncio.create_task(controller.route_command(client_command(seq=seq)))
+            await self.wait_for_messages(writer, seq)
+            board_seq = writer.messages[-1]["seq"]
+            clock.advance(latency_s)
+            await controller.handle_board_response(ok_response(board_seq))
+            response = await task
+            self.assertEqual(response["status"], "ok")
+
+        snapshot = controller.metrics_snapshot()
+        board_metrics = snapshot["boards"]["motor"]
+        self.assertEqual(snapshot["command_latency_sample_count"], 5)
+        self.assertAlmostEqual(snapshot["command_latency_p50_ms"], 30.0)
+        self.assertAlmostEqual(snapshot["command_latency_p95_ms"], 100.0)
+        self.assertAlmostEqual(snapshot["command_latency_p99_ms"], 100.0)
+        self.assertEqual(board_metrics["command_latency_sample_count"], 5)
+        self.assertAlmostEqual(board_metrics["command_latency_p50_ms"], 30.0)
+        self.assertAlmostEqual(board_metrics["command_latency_p95_ms"], 100.0)
+        self.assertAlmostEqual(board_metrics["command_latency_p99_ms"], 100.0)
 
     async def test_unknown_command_returns_unknown_command_error(self):
         controller = self.make_controller()
