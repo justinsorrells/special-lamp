@@ -879,7 +879,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Author companion contracts and guides
+* [x] Task: Author companion contracts and guides
 
   ## Goal
 
