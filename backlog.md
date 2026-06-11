@@ -740,7 +740,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Add controller runtime entrypoint, configuration, and signal handling (contract 0, 6.9)
+* [x] Task: Add controller runtime entrypoint, configuration, and signal handling (contract 0, 6.9)
 
   ## Goal
 
