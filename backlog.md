@@ -901,7 +901,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Repo hygiene — root contract duplicate, pytest path, stray-file guard
+* [x] Task: Repo hygiene — root contract duplicate, pytest path, stray-file guard
 
   ## Goal
 
