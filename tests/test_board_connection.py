@@ -206,7 +206,9 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.controller.state.boards["motor"].conn_state, BoardConnState.REGISTERED)
         self.assertGreaterEqual(self.server.connections, 2)
-        self.assertGreaterEqual(self.controller.metrics_snapshot()["reconnect_count"], 1)
+        self.assertEqual(
+            self.controller.metrics_snapshot()["reconnect_count"], self.server.connections
+        )
 
     async def test_late_response_after_timeout_is_dropped_through_core(self):
         self.start_connection()

@@ -648,7 +648,7 @@ class ControllerCore:
         self.counters.increment("local_event_dropped")
         self.counters.increment("client_event_dropped")
 
-    def record_reconnect_attempt(self) -> None:
+    def record_reconnect(self) -> None:
         self.counters.increment("reconnect_count")
 
     def record_registration_timeout(self) -> None:

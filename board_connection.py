@@ -192,7 +192,6 @@ class BoardTCPConnection:
                 await self._wait_before_reconnect()
 
     async def _wait_before_reconnect(self) -> None:
-        self.controller.record_reconnect_attempt()
         delay_s = self.reconnect_backoff.next_delay_s()
         try:
             await asyncio.wait_for(self._stop.wait(), timeout=delay_s)
@@ -212,6 +211,7 @@ class BoardTCPConnection:
                 self.endpoint.port,
                 limit=CONTROLLER_MAX_LINE_BYTES,
             )
+            self.controller.record_reconnect()
             self.controller.set_board_state(self.endpoint.board_id, BoardConnState.CONNECTED)
             stream_writer = StreamBoardWriter(self.endpoint.board_id, raw_writer)
             self._stream_writer = stream_writer

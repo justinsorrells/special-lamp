@@ -777,7 +777,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Complete section 4 metrics and latency percentiles (contract 4)
+* [x] Task: Complete section 4 metrics and latency percentiles (contract 4)
 
   ## Goal
 
