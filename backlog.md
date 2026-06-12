@@ -930,7 +930,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Expose a schema discovery API for local clients
+* [x] Task: Expose a schema discovery API for local clients
 
   ## Goal
 
