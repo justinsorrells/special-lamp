@@ -928,4 +928,294 @@ General rules for every task:
   mypy .
   ```
 
+---
+
+* [ ] Task: Expose a schema discovery API for local clients
+
+  ## Goal
+
+  Let local client programs ask the controller "what boards exist and what can
+  I say to them?" Today each board pushes its schema on connect (contract 1.3)
+  and the controller caches it (`controller.py:166` → `BoardState.schema`,
+  `state.py:131`), but nothing exposes that cache: a local client has no way to
+  enumerate boards, commands, argument shapes, `blocked_by_estop` gating,
+  telemetry fields, or protocol/firmware versions.
+
+  Motivation: the follow-on project is a dynamically generated web GUI that
+  builds its controls and telemetry views entirely from the board schemas,
+  enabling rapid integration testing. That GUI is a local client like any other
+  (Unix socket, full-duplex, never talks to boards) — it needs a discovery
+  query plus a change notification so it can rebuild when a board's schema
+  changes.
+
+  The controller's in-memory schema cache is the source of truth. The API is a
+  read of controller-owned state; it must never solicit a schema from a board
+  (contract 1.3: no `get_schema` board command exists) and must never touch the
+  board wire.
+
+  ## Design: controller-local commands (pin the semantics explicitly)
+
+  Reuse the existing `command` message type with `target: "controller"` and
+  `command: "get_schemas"` — no new top-level message type, no board wire
+  change, no board `protocol_version` bump. This introduces a new class of
+  message, the **controller-local command**, and its semantics must be written
+  down, not left implicit:
+
+  * handled entirely by the controller; never forwarded to a board
+  * never allocated a `board_seq`
+  * never placed in any per-board FIFO
+  * never consumes the one-command-in-flight slot
+  * never acquires a per-board writer lock; never touches the TCP path
+  * not subject to board execution timeouts or the queue residency cap
+  * replies with the normal client-facing `response` shape: client `seq`
+    echoed, terminal status from `{ok, error, timeout}`, existing error codes
+
+  Dispatch is an **explicit allowlist registry** mapping command name →
+  handler; `get_schemas` is its first and only entry. Unknown names →
+  `UNKNOWN_COMMAND`. Never resolve controller-local commands dynamically via
+  reflection or unrestricted attribute lookup — `target: "controller"` must
+  not turn arbitrary command names into controller method calls.
+
+  **Where to pin it:** `docs/contracts/V1_Networking_Decisions.md` is frozen
+  and the board protocol is untouched, so do not amend it. Author a normative
+  companion doc, `docs/companion/Local_Client_API.md`, defining
+  controller-local command semantics and the exact request/response/event
+  shapes below (same pattern as the Configuration Contract, which deliberately
+  lives outside `docs/contracts/`). The frozen contract still wins on any
+  conflict; if controller-targeted `command` cannot be reconciled cleanly with
+  it, stop and report instead of creating undocumented protocol behavior. The
+  operator may ratify folding this into the contract at the next unfreeze.
+
+  ## Request shape and `args` rules (pin exactly)
+
+  All boards:
+
+  ```json
+  {"type": "command", "seq": 41, "timestamp": 1710000100.0,
+   "source": "gui", "target": "controller",
+   "command": "get_schemas", "args": {}}
+  ```
+
+  One board:
+
+  ```json
+  {"type": "command", "seq": 42, "timestamp": 1710000100.0,
+   "source": "gui", "target": "controller",
+   "command": "get_schemas", "args": {"board_id": "motor_controller"}}
+  ```
+
+  Validation is two layers; do not re-pin or fork the first:
+
+  * **Generic `command` validation** (existing `protocol.py` behavior,
+    unchanged): missing `args` → `MISSING_FIELD`; `null` or non-object
+    `args` → `INVALID_TYPE` (`protocol.py:380-385,478-484`). Controller-local
+    commands pass through the same `validate_message` path as board-bound
+    commands before dispatch.
+  * **Handler-level rules** for `get_schemas` (the handler receives a
+    validated dict): `{}` → all configured boards;
+    `{"board_id": "<id>"}` → that configured board; any unsupported extra
+    `args` key or a non-string `board_id` → `INVALID_ARGUMENT`; an unknown
+    `board_id` → `UNKNOWN_TARGET`.
+
+  Document both layers and both example requests verbatim in
+  `docs/companion/Local_Client_API.md`.
+
+  ## Result shape (pin exactly)
+
+  One consistent envelope for filtered and unfiltered queries — `result.boards`
+  is **always a list**, sorted by `board_id` for deterministic output, one
+  record per **configured** board:
+
+  ```json
+  {"result": {"boards": [
+      {"board_id": "motor_controller",
+       "known": true,
+       "available": false,
+       "conn_state": "DISCONNECTED",
+       "schema_revision": 3,
+       "protocol_version": "1",
+       "firmware_version": "0.1.0",
+       "schema": {"commands": {"set_speed": {"args": {"rpm": "int"},
+                                             "blocked_by_estop": true}},
+                  "telemetry": {"rpm": "int"},
+                  "state": {"mode": "string"}}}]}}
+  ```
+
+  * A filtered query returns a one-element `boards` list; an unknown
+    `board_id` returns `UNKNOWN_TARGET`, never an empty list.
+  * `known`: the controller has accepted at least one valid schema from this
+    board (this controller run).
+  * `available`: `conn_state == REGISTERED`. **Connection axis only** — do not
+    fold e-stop into it; the safety axis reaches clients via existing events
+    and per-command `blocked_by_estop` gating (the two axes stay orthogonal).
+  * A disconnected board returns its most recently accepted schema: the cache
+    must persist across disconnects (verify current `BoardState` behavior and
+    pin it).
+  * A configured but never-registered board returns `known: false`,
+    `available: false`, `schema_revision: 0`, `schema: null`, and `null`
+    version fields.
+  * `schema` is the **effective schema**: a deep copy of the accepted schema
+    with `blocked_by_estop` materialized on every command (explicit values
+    kept; absent ⇒ `true` per 1.17). No separate gating map. The controller's
+    stored original is never mutated.
+
+  ## Schema revision and `schema_updated` event
+
+  * `schema_revision` is a controller-owned in-memory counter per board: `0`
+    until a valid schema is accepted, `1` on first acceptance, incremented
+    when the accepted record changes. "Changed" compares the tuple
+    (**effective schema**, `protocol_version`, `firmware_version`) by
+    structured equality, not raw JSON text — so a reconnect that merely turns
+    an absent `blocked_by_estop` into an explicit `true` is not a change, but
+    a firmware update that leaves commands/telemetry/state untouched **is** a
+    change (a client must not miss a firmware rollout). An identical record
+    on reconnect does not increment the revision. (Contract 3.7 nests
+    `firmware_version` inside the schema body, so an effective-schema
+    comparison may already capture it; pin the tuple anyway so the behavior
+    survives any record-shape refactor.) A `protocol_version` mismatch still
+    fails registration per contract 1.16 and therefore never updates the
+    accepted record or revision.
+  * **Atomic pair update:** on schema acceptance, produce the new record
+    tuple, compare it to the stored one, and — if changed — update the
+    cached schema and revision together with **no `await` between the
+    comparison and the update** (same discipline as pop-wins, 1.8). Enqueue `schema_updated` only after the state update. A
+    concurrent query must observe old-schema+old-revision or
+    new-schema+new-revision, never a mixed pair.
+  * Revisions are scoped to one controller process lifetime — they are not
+    persisted and reset on controller restart, so they are **not comparable
+    across controller sessions**. Clients must treat the revision as an opaque
+    change marker valid within one socket session, and must discard cached
+    revisions and re-query after reconnecting to the controller socket.
+    Document this caveat prominently in the companion doc.
+  * `schema_updated` event: existing local `event` mechanism, classified
+    **non-critical** (droppable under 1.18 backpressure — a client that misses
+    it re-queries; dropping it must not disconnect the client). Emitted only
+    when a schema first becomes known or its effective content changes — not
+    on ordinary reconnects with an identical schema. Pin this exact shape,
+    following the contract 3.8 event convention (payload under `details`, as
+    `estop_triggered` does):
+
+    ```json
+    {"type": "event", "event_id": 90413, "timestamp": 1710000101.0,
+     "source": "controller", "event": "schema_updated",
+     "details": {"board_id": "motor_controller", "schema_revision": 3}}
+    ```
+
+    Verify the name-based criticality check in `local_socket.py` classifies
+    `schema_updated` as non-critical (it does not start with `estop` and must
+    not be added to the critical-event set).
+
+  ## Filtering and response size
+
+  * Optional `args: {"board_id": "<id>"}` returns a one-element `boards`
+    list. Unknown board id → `UNKNOWN_TARGET`; malformed `args` →
+    `INVALID_ARGUMENT`.
+  * Two distinct limits — do not conflate them under one "local line limit":
+
+    * `LOCAL_REQUEST_MAX_LINE` — the existing client→controller inbound
+      limit, **unchanged** (schema query requests are tiny; do not grow
+      controller inbound capacity).
+    * `LOCAL_RESPONSE_MAX_LINE` — new, controller→client, default **64 KiB**,
+      configurable (matches the asyncio readline default).
+  * Size-check every `get_schemas` response before sending, measured as the
+    final UTF-8 encoded bytes **including the terminating newline**
+    (`len(encoded_json) + 1`). An over-limit aggregate response →
+    `status: "error"`, code `INVALID_ARGUMENT`, message: "All-board schema
+    response exceeds the local response limit; retry with args.board_id." A
+    filtered response that itself exceeds the limit returns the same code
+    with a message that the individual board schema is too large for the
+    local API (in practice unreachable — a single schema is capped by the
+    8 KB board-outbound limit — but the path must not be left undefined).
+  * `INVALID_ARGUMENT` is reused deliberately: contract 3.11's error-code
+    list is frozen with the contract, so this task adds no new code; revisit
+    a dedicated code only at a contract unfreeze.
+  * The 8 KB controller receive limit for board messages (1.9) is unchanged.
+    Document both local limits — and that clients must configure their stream
+    reader to accept response lines of at least 64 KiB — in the companion doc
+    and `Integration_Guide.md`.
+
+  ## Files
+
+  * `local_socket.py` — dispatch seam for controller-local commands
+    (`local_socket.py:278-291`), response size check
+  * `controller.py` — effective-schema snapshot over controller-owned state;
+    revision tracking; `schema_updated` emission at registration
+  * `state.py` — `schema_revision` / record helpers as needed
+  * New `docs/companion/Local_Client_API.md`; update
+    `docs/companion/Integration_Guide.md`
+  * `tests/test_local_socket.py`, `tests/test_controller_core.py`,
+    `tests/test_local_loop_integration.py`
+
+  ## Do not implement
+
+  * The web GUI itself (separate project, after this stack wraps).
+  * A `get_schema` board command, firmware changes, or any board-wire /
+    `protocol_version` change.
+  * New terminal statuses, new error codes, new architecture.
+  * New schema validation semantics beyond what `protocol.py` already
+    enforces.
+  * Redis schema mirroring (`board:schema:<id>`): dropped from this task. It
+    does not help the GUI query the controller; add it later only if a Redis
+    consumer actually needs it. Redis stays out of the query path entirely.
+  * Contract edits: `docs/contracts/`, `AGENTS.md`, `.agents/skills/` stay
+    untouched.
+
+  ## Tests should cover
+
+  * Query returns all configured boards with the pinned record shape inside
+    `result.boards`, which is always a list sorted by `board_id`;
+    never-registered board → `known: false`, `schema: null`,
+    `schema_revision: 0`.
+  * Filtered query returns a one-element `boards` list with the same record
+    shape as the aggregate query (no shape divergence).
+  * Disconnected board returns its cached schema with `available: false`.
+  * Concurrent query during an (awaitable) registration path observes a
+    consistent schema/revision pair — old/old or new/new, never mixed.
+  * First accepted schema sets revision to `1`; changed schema increments it;
+    identical schema after reconnect neither increments the revision nor emits
+    `schema_updated`.
+  * Changed `firmware_version` with identical commands/telemetry/state
+    increments the revision and emits `schema_updated`.
+  * `protocol_version` mismatch fails registration (existing 1.16 behavior)
+    and leaves the accepted record and revision untouched.
+  * Changed schema emits `schema_updated` matching the pinned 3.8-style shape
+    (`details.board_id`, `details.schema_revision`); the event is classified
+    non-critical and may drop under backpressure without disconnecting the
+    client.
+  * Effective schema materializes absent `blocked_by_estop` as `true`, keeps
+    explicit values, and generating it does not mutate stored controller state
+    (returned payload is a copy).
+  * Schema query allocates no `board_seq` and never touches the board FIFO,
+    in-flight slot, writer lock, or TCP path.
+  * Query succeeds while `estop_active=true` and while Redis is disabled or
+    down.
+  * Response echoes the client's `seq`; two clients using the same client
+    `seq` receive independent correct responses; `seq` / `board_seq` never
+    conflated.
+  * `args` validation, every pinned case: `{}` returns all boards; missing
+    `args` → `MISSING_FIELD` and `null`/non-object `args` → `INVALID_TYPE`
+    (existing generic command validation, unchanged); unsupported extra
+    `args` key → `INVALID_ARGUMENT`; non-string `board_id` →
+    `INVALID_ARGUMENT`; unknown `board_id` → `UNKNOWN_TARGET` (never an
+    empty list); a command name not in the controller-local allowlist
+    registry → `UNKNOWN_COMMAND`.
+  * All-board response over `LOCAL_RESPONSE_MAX_LINE` fails cleanly with
+    `INVALID_ARGUMENT` and the documented retry-with-`args.board_id` message;
+    the per-board filtered query still succeeds for the same fleet; the size
+    check measures encoded bytes including the terminating newline.
+  * Companion doc and integration guide use the same request/response/event
+    shapes the implementation serves (extend `tests/test_companion_docs.py`
+    if it checks doc/code consistency).
+  * No new terminal statuses or error codes introduced; normal command routing
+    unaffected.
+
+  ## Validation
+
+  ```bash
+  python -m pytest
+  python tools/check_invariants.py
+  ruff check .
+  mypy .
+  ```
+
 
