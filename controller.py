@@ -8,8 +8,10 @@ does not implement Unix sockets, TCP connections, Redis, GUI, or firmware.
 from __future__ import annotations
 
 import asyncio
+import copy
+import time
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Coroutine
 from dataclasses import dataclass, field, fields
 from typing import Any
 
@@ -24,6 +26,7 @@ from protocol import (
     check_protocol_version,
     extract_blocked_by_estop,
     pop_pending,
+    serialize_message,
     validate_message,
 )
 from state import (
@@ -41,6 +44,16 @@ from state import (
 
 DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 DEFAULT_SHUTDOWN_CLOSE_TIMEOUT_S = 0.2
+DEFAULT_LOCAL_RESPONSE_MAX_LINE_BYTES = 64 * 1024
+CONTROLLER_LOCAL_TARGET = "controller"
+GET_SCHEMAS_COMMAND = "get_schemas"
+
+
+@dataclass(frozen=True)
+class _SchemaRecord:
+    effective_schema: dict[str, Any]
+    protocol_version: str
+    firmware_version: str | None
 
 
 @dataclass
@@ -110,6 +123,7 @@ class _BoardRuntime:
     seq_counter: BoardSeqCounter = field(default_factory=BoardSeqCounter)
     fifo: deque[PendingCommand] = field(default_factory=deque)
     blocked_by_estop: dict[str, bool] = field(default_factory=dict)
+    schema_record: _SchemaRecord | None = None
 
 
 class ControllerCore:
@@ -144,6 +158,17 @@ class ControllerCore:
         self._command_latency_percentiles = LatencyPercentileObservation()
         self._shutdown_task: asyncio.Task[None] | None = None
         self._shutting_down = False
+        self._next_controller_event_id = 1
+        self._local_event_sink: Callable[[dict[str, Any]], Coroutine[Any, Any, None] | None] | None = None
+        self._controller_local_handlers = {
+            GET_SCHEMAS_COMMAND: self._handle_get_schemas,
+        }
+
+    def set_local_event_sink(
+        self,
+        sink: Callable[[dict[str, Any]], Coroutine[Any, Any, None] | None] | None,
+    ) -> None:
+        self._local_event_sink = sink
 
     def register_board(
         self,
@@ -162,14 +187,34 @@ class ControllerCore:
             runtime.state.conn_state = BoardConnState.FAULTED
             self.state.refresh_connected_count()
             raise
+        schema_record = self._schema_record_from_message(schema)
+        schema_changed = runtime.schema_record != schema_record
+        if schema_changed:
+            runtime.state.schema_revision += 1
+            runtime.schema_record = schema_record
         runtime.writer = writer
-        runtime.state.schema = schema
+        runtime.state.schema = copy.deepcopy(schema)
         runtime.blocked_by_estop = extract_blocked_by_estop(schema)
         runtime.state.conn_state = BoardConnState.REGISTERED
         runtime.state.queue_depth = len(runtime.fifo)
         self.state.refresh_connected_count()
         self._observe_board_state(runtime.state)
         self._observe_system_state()
+        if schema_changed:
+            self._emit_controller_event(
+                {
+                    "type": MessageType.EVENT.value,
+                    "event_id": self._next_event_id(),
+                    "timestamp": self._monotonic_time(),
+                    "source": "controller",
+                    "event": "schema_updated",
+                    "details": {
+                        "board_id": board_id,
+                        "schema_revision": runtime.state.schema_revision,
+                    },
+                },
+                broadcast_local=True,
+            )
 
     def set_board_state(self, board_id: str, conn_state: BoardConnState) -> None:
         runtime = self._boards[board_id]
@@ -198,6 +243,12 @@ class ControllerCore:
             )
             self._record_terminal_response(response)
             return response
+
+        if board_id == CONTROLLER_LOCAL_TARGET:
+            return self._route_controller_local_command(
+                command,
+                max_response_line_bytes=DEFAULT_LOCAL_RESPONSE_MAX_LINE_BYTES,
+            )
 
         self._observe_command_lifecycle_phase(command, board_id=board_id, phase="received")
 
@@ -610,6 +661,34 @@ class ControllerCore:
         validate_message(response)
         return response
 
+    def route_controller_local_command(
+        self,
+        command: dict[str, Any],
+        *,
+        max_response_line_bytes: int = DEFAULT_LOCAL_RESPONSE_MAX_LINE_BYTES,
+    ) -> dict[str, Any]:
+        validate_message(command)
+        if command["target"] != CONTROLLER_LOCAL_TARGET:
+            return build_error_response(
+                seq=command["seq"],
+                target=command["source"],
+                code=ErrorCode.UNKNOWN_TARGET,
+                message=f"unknown controller target {command['target']}",
+            )
+        if self._shutting_down:
+            response = build_error_response(
+                seq=command["seq"],
+                target=command["source"],
+                code=ErrorCode.CONTROLLER_SHUTDOWN,
+                message="controller is shutting down",
+            )
+            self._record_terminal_response(response)
+            return response
+        return self._route_controller_local_command(
+            command,
+            max_response_line_bytes=max_response_line_bytes,
+        )
+
     def pending_count(self, board_id: str | None = None) -> int:
         if board_id is None:
             return len(self._pending)
@@ -790,6 +869,141 @@ class ControllerCore:
         if not isinstance(source, str):
             return "client"
         return source
+
+    def _route_controller_local_command(
+        self,
+        command: dict[str, Any],
+        *,
+        max_response_line_bytes: int,
+    ) -> dict[str, Any]:
+        handler = self._controller_local_handlers.get(command["command"])
+        if handler is None:
+            response = build_error_response(
+                seq=command["seq"],
+                target=command["source"],
+                code=ErrorCode.UNKNOWN_COMMAND,
+                message=f"unknown controller-local command {command['command']}",
+            )
+            self._record_terminal_response(response)
+            return response
+        response = handler(command, max_response_line_bytes=max_response_line_bytes)
+        self._record_terminal_response(response)
+        return response
+
+    def _handle_get_schemas(
+        self,
+        command: dict[str, Any],
+        *,
+        max_response_line_bytes: int,
+    ) -> dict[str, Any]:
+        args = command["args"]
+        unsupported = set(args) - {"board_id"}
+        if unsupported:
+            return build_error_response(
+                seq=command["seq"],
+                target=command["source"],
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="unsupported args for get_schemas",
+            )
+        board_id = args.get("board_id")
+        if board_id is not None and not isinstance(board_id, str):
+            return build_error_response(
+                seq=command["seq"],
+                target=command["source"],
+                code=ErrorCode.INVALID_ARGUMENT,
+                message="args.board_id must be a string",
+            )
+        if board_id is not None:
+            runtime = self._boards.get(board_id)
+            if runtime is None:
+                return build_error_response(
+                    seq=command["seq"],
+                    target=command["source"],
+                    code=ErrorCode.UNKNOWN_TARGET,
+                    message=f"unknown board {board_id}",
+                )
+            boards = [self._schema_snapshot_for_board(runtime)]
+        else:
+            boards = [
+                self._schema_snapshot_for_board(self._boards[known_board_id])
+                for known_board_id in sorted(self._boards)
+            ]
+
+        response = {
+            "type": MessageType.RESPONSE.value,
+            "seq": command["seq"],
+            "source": "controller",
+            "target": command["source"],
+            "status": "ok",
+            "result": {"boards": boards},
+            "error": None,
+        }
+        validate_message(response)
+        try:
+            serialize_message(response, max_line_bytes=max_response_line_bytes)
+        except ProtocolValidationError:
+            if board_id is None:
+                message = "All-board schema response exceeds the local response limit; retry with args.board_id."
+            else:
+                message = "Individual board schema response exceeds the local response limit."
+            return build_error_response(
+                seq=command["seq"],
+                target=command["source"],
+                code=ErrorCode.INVALID_ARGUMENT,
+                message=message,
+            )
+        return response
+
+    def _schema_snapshot_for_board(self, runtime: _BoardRuntime) -> dict[str, Any]:
+        state = runtime.state
+        record = runtime.schema_record
+        return {
+            "board_id": state.board_id,
+            "known": record is not None,
+            "available": state.conn_state is BoardConnState.REGISTERED,
+            "conn_state": state.conn_state.value,
+            "schema_revision": state.schema_revision,
+            "protocol_version": None if record is None else record.protocol_version,
+            "firmware_version": None if record is None else record.firmware_version,
+            "schema": None if record is None else copy.deepcopy(record.effective_schema),
+        }
+
+    def _schema_record_from_message(self, schema: dict[str, Any]) -> _SchemaRecord:
+        validate_message(schema)
+        body = copy.deepcopy(schema["schema"])
+        commands = body.setdefault("commands", {})
+        for command_meta in commands.values():
+            command_meta["blocked_by_estop"] = command_meta.get("blocked_by_estop", True)
+        firmware_version = body.get("firmware_version")
+        if firmware_version is not None and not isinstance(firmware_version, str):
+            firmware_version = None
+        return _SchemaRecord(
+            effective_schema=body,
+            protocol_version=schema["protocol_version"],
+            firmware_version=firmware_version,
+        )
+
+    def _next_event_id(self) -> int:
+        event_id = self._next_controller_event_id
+        self._next_controller_event_id += 1
+        return event_id
+
+    def _emit_controller_event(
+        self,
+        event: dict[str, Any],
+        *,
+        broadcast_local: bool = False,
+    ) -> None:
+        validate_message(event)
+        self.observe_controller_event(event)
+        if not broadcast_local or self._local_event_sink is None:
+            return
+        result = self._local_event_sink(event)
+        if result is not None:
+            try:
+                asyncio.create_task(result)
+            except RuntimeError:
+                result.close()
 
     async def _dispatch_next(self, board_id: str) -> None:
         runtime = self._boards[board_id]
@@ -1076,7 +1290,10 @@ class ControllerCore:
     def _monotonic_time(self) -> float:
         if self._monotonic_clock is not None:
             return self._monotonic_clock()
-        return asyncio.get_running_loop().time()
+        try:
+            return asyncio.get_running_loop().time()
+        except RuntimeError:
+            return time.monotonic()
 
     def _extract_board_proc_us(self, response: dict[str, Any]) -> float | None:
         value = response.get("board_proc_us")

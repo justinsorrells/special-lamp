@@ -19,6 +19,7 @@ class CompanionDocsTests(unittest.TestCase):
             "README.md",
             "Component_Handoff_Contracts.md",
             "Integration_Guide.md",
+            "Local_Client_API.md",
             "Test_Matrix.md",
         }
         self.assertEqual({path.name for path in COMPANION_DIR.glob("*.md")}, expected)
@@ -36,6 +37,7 @@ class CompanionDocsTests(unittest.TestCase):
         for name in (
             "Component_Handoff_Contracts.md",
             "Integration_Guide.md",
+            "Local_Client_API.md",
             "Test_Matrix.md",
         ):
             self.assertIn(name, text)
@@ -82,6 +84,8 @@ class CompanionDocsTests(unittest.TestCase):
         self.assertIn("Do not add a GUI-to-board path", text)
         self.assertIn("Missing means blocked", text)
         self.assertIn("Clients must read continuously", text)
+        self.assertIn('command: "get_schemas"', text)
+        self.assertIn("64 KiB", text)
         self.assertIn("does not auto-clear", text)
         self.assertIn("operator `estop_reset`", text)
         self.assertIn("Redis is optional observability infrastructure", text)
@@ -108,3 +112,12 @@ class CompanionDocsTests(unittest.TestCase):
         for status in TERMINAL_STATUSES:
             self.assertIn(f"`{status}`", text)
 
+    def test_local_client_api_documents_schema_discovery_shape(self) -> None:
+        text = self._read("Local_Client_API.md")
+        self.assertIn('"target":"controller"', text)
+        self.assertIn('"command":"get_schemas"', text)
+        self.assertIn('"result":{"boards"', text)
+        self.assertIn("UNKNOWN_TARGET", text)
+        self.assertIn("INVALID_ARGUMENT", text)
+        self.assertIn("schema_updated", text)
+        self.assertIn("64 KiB", text)

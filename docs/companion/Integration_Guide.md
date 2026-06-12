@@ -61,6 +61,12 @@ the board.
   matching request.
 - Clients should treat e-stop and safety events as critical and update their UI
   from controller events, not by talking directly to boards.
+- Clients discover configured boards and accepted board schemas with the
+  controller-local `command: "get_schemas"` API documented in
+  `Local_Client_API.md`.
+- Client request lines are capped at the controller receive limit, 8 KiB.
+  Schema discovery responses may be larger; clients should configure their
+  stream reader to accept controller-to-client response lines of at least 64 KiB.
 
 ## E-Stop Operation
 

@@ -14,7 +14,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
-from controller import ControllerCore
+from controller import DEFAULT_LOCAL_RESPONSE_MAX_LINE_BYTES, ControllerCore
 from protocol import (
     CONTROLLER_MAX_LINE_BYTES,
     ErrorCode,
@@ -25,6 +25,9 @@ from protocol import (
     serialize_message,
     validate_message,
 )
+
+LOCAL_REQUEST_MAX_LINE_BYTES = CONTROLLER_MAX_LINE_BYTES
+LOCAL_RESPONSE_MAX_LINE_BYTES = DEFAULT_LOCAL_RESPONSE_MAX_LINE_BYTES
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,7 @@ class LocalClientConnection:
     reader: asyncio.StreamReader
     writer: asyncio.StreamWriter
     outbound_maxsize: int
+    response_max_line_bytes: int = LOCAL_RESPONSE_MAX_LINE_BYTES
     on_event_dropped: Callable[[], None] | None = None
     on_critical_disconnect: Callable[[], None] | None = None
     connected: bool = True
@@ -91,7 +95,9 @@ class LocalClientConnection:
             if item is None:
                 return
             try:
-                self.writer.write(serialize_message(item.message, max_line_bytes=CONTROLLER_MAX_LINE_BYTES))
+                self.writer.write(
+                    serialize_message(item.message, max_line_bytes=self.response_max_line_bytes)
+                )
                 await self.writer.drain()
             except (ConnectionError, OSError, ProtocolValidationError):
                 self.connected = False
@@ -172,23 +178,26 @@ class LocalUnixSocketServer:
         socket_path: str,
         controller: ControllerCore,
         outbound_queue_size: int = 1000,
+        local_response_max_line_bytes: int = LOCAL_RESPONSE_MAX_LINE_BYTES,
         estop_reset_condition_cleared: Callable[[], bool] | None = None,
     ):
         self.socket_path = socket_path
         self.controller = controller
         self.outbound_queue_size = outbound_queue_size
+        self.local_response_max_line_bytes = local_response_max_line_bytes
         self.estop_reset_condition_cleared = estop_reset_condition_cleared or (lambda: True)
         self.server: asyncio.AbstractServer | None = None
         self.clients: set[LocalClientConnection] = set()
         self.client_event_dropped = 0
         self.critical_event_disconnects = 0
+        self.controller.set_local_event_sink(self.broadcast_event)
 
     async def start(self) -> None:
         await self._prepare_socket_path()
         self.server = await asyncio.start_unix_server(
             self._handle_client,
             path=self.socket_path,
-            limit=CONTROLLER_MAX_LINE_BYTES,
+            limit=LOCAL_REQUEST_MAX_LINE_BYTES,
         )
         os.chmod(self.socket_path, 0o600)
 
@@ -230,6 +239,7 @@ class LocalUnixSocketServer:
             reader=reader,
             writer=writer,
             outbound_maxsize=self.outbound_queue_size,
+            response_max_line_bytes=self.local_response_max_line_bytes,
             on_event_dropped=self._increment_client_event_dropped,
             on_critical_disconnect=self._increment_critical_event_disconnects,
         )
@@ -288,6 +298,9 @@ class LocalUnixSocketServer:
                         )
                     )
                     continue
+                if message["target"] == "controller":
+                    asyncio.create_task(self._controller_command_and_reply(client, message))
+                    continue
                 asyncio.create_task(self._route_and_reply(client, message))
         finally:
             self.clients.discard(client)
@@ -300,6 +313,19 @@ class LocalUnixSocketServer:
         command: dict[str, Any],
     ) -> None:
         response = await self.controller.route_command(command)
+        delivered = await client.send_response(response)
+        if not delivered:
+            self.controller.record_orphaned_response()
+
+    async def _controller_command_and_reply(
+        self,
+        client: LocalClientConnection,
+        command: dict[str, Any],
+    ) -> None:
+        response = self.controller.route_controller_local_command(
+            command,
+            max_response_line_bytes=client.response_max_line_bytes,
+        )
         delivered = await client.send_response(response)
         if not delivered:
             self.controller.record_orphaned_response()
@@ -337,7 +363,7 @@ class LocalUnixSocketServer:
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         message: dict[str, Any] | None = None
         try:
-            message = parse_line(line, max_line_bytes=CONTROLLER_MAX_LINE_BYTES)
+            message = parse_line(line, max_line_bytes=LOCAL_REQUEST_MAX_LINE_BYTES)
             validate_message(message)
         except ProtocolValidationError as exc:
             return None, build_error_response(

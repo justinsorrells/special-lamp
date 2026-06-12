@@ -129,6 +129,7 @@ class BoardState:
     queue_depth: int = 0
     in_flight_board_seq: int | None = None
     schema: dict[str, Any] | None = None
+    schema_revision: int = 0
     last_command_latency: CommandLatencyObservation | None = None
     command_latency_percentiles: LatencyPercentileObservation = field(
         default_factory=LatencyPercentileObservation

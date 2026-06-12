@@ -46,6 +46,15 @@ def ok_response(seq):
     }
 
 
+def schema_query(seq=90, args=None):
+    return client_command(
+        seq=seq,
+        target="controller",
+        command="get_schemas",
+        args={} if args is None else args,
+    )
+
+
 def queued_payloads(client):
     return [item.message for item in list(client.outbound._queue) if item is not None]
 
@@ -150,6 +159,40 @@ class LocalSocketBackpressureTests(unittest.IsolatedAsyncioTestCase):
 
         await self.server.broadcast_event(event_message(1))
         await self.server.broadcast_event(event_message(2))
+
+        self.assertEqual(self.server.client_event_dropped, 1)
+        self.assertEqual([message["event_id"] for message in queued_payloads(client)], [2])
+        self.assertEqual(self.server.critical_event_disconnects, 0)
+        self.assertTrue(client.is_connected)
+
+    async def test_schema_updated_event_is_noncritical_and_droppable(self):
+        client = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=1,
+            on_event_dropped=self.server._increment_client_event_dropped,
+            on_critical_disconnect=self.server._increment_critical_event_disconnects,
+        )
+        self.server.clients.add(client)
+
+        await self.server.broadcast_event(
+            {
+                "type": "event",
+                "event_id": 1,
+                "source": "controller",
+                "event": "schema_updated",
+                "details": {"board_id": "motor", "schema_revision": 1},
+            }
+        )
+        await self.server.broadcast_event(
+            {
+                "type": "event",
+                "event_id": 2,
+                "source": "controller",
+                "event": "schema_updated",
+                "details": {"board_id": "motor", "schema_revision": 2},
+            }
+        )
 
         self.assertEqual(self.server.client_event_dropped, 1)
         self.assertEqual([message["event_id"] for message in queued_payloads(client)], [2])
@@ -288,6 +331,100 @@ class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
         finally:
             writer.close()
             await writer.wait_closed()
+
+    async def test_get_schemas_routes_to_controller_local_api_without_board_write(self):
+        reader, writer = await self.connect_client()
+        try:
+            writer.write(encode(schema_query(seq=90)))
+            await writer.drain()
+
+            response = await read_json(reader)
+
+            self.assertEqual(response["status"], "ok")
+            self.assertEqual(response["seq"], 90)
+            self.assertEqual(response["target"], "gui")
+            self.assertEqual([record["board_id"] for record in response["result"]["boards"]], ["motor"])
+            self.assertTrue(response["result"]["boards"][0]["known"])
+            self.assertEqual(response["result"]["boards"][0]["schema_revision"], 1)
+            self.assertEqual(self.board_writer.messages, [])
+            self.assertEqual(self.controller.pending_count(), 0)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def test_two_clients_with_same_seq_get_independent_schema_responses(self):
+        reader_a, writer_a = await self.connect_client()
+        reader_b, writer_b = await self.connect_client()
+        try:
+            writer_a.write(encode(schema_query(seq=7, args={"board_id": "motor"})))
+            writer_b.write(encode(schema_query(seq=7, args={"board_id": "motor"})))
+            await writer_a.drain()
+            await writer_b.drain()
+
+            response_a = await read_json(reader_a)
+            response_b = await read_json(reader_b)
+
+            self.assertEqual(response_a["seq"], 7)
+            self.assertEqual(response_b["seq"], 7)
+            self.assertEqual(response_a["status"], "ok")
+            self.assertEqual(response_b["status"], "ok")
+            self.assertEqual(response_a["result"]["boards"][0]["board_id"], "motor")
+            self.assertEqual(response_b["result"]["boards"][0]["board_id"], "motor")
+            self.assertEqual(self.board_writer.messages, [])
+        finally:
+            writer_a.close()
+            writer_b.close()
+            await writer_a.wait_closed()
+            await writer_b.wait_closed()
+
+    async def test_get_schemas_generic_args_validation_still_uses_protocol_errors(self):
+        reader, writer = await self.connect_client()
+        try:
+            missing_args = {
+                "type": "command",
+                "seq": 91,
+                "source": "gui",
+                "target": "controller",
+                "command": "get_schemas",
+            }
+            null_args = {
+                "type": "command",
+                "seq": 92,
+                "source": "gui",
+                "target": "controller",
+                "command": "get_schemas",
+                "args": None,
+            }
+            writer.write(encode(missing_args))
+            writer.write(encode(null_args))
+            await writer.drain()
+
+            missing_response = await read_json(reader)
+            null_response = await read_json(reader)
+
+            self.assertEqual(missing_response["seq"], 91)
+            self.assertEqual(missing_response["error"]["code"], ErrorCode.MISSING_FIELD.value)
+            self.assertEqual(null_response["seq"], 92)
+            self.assertEqual(null_response["error"]["code"], ErrorCode.INVALID_TYPE.value)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
+    async def test_get_schemas_response_over_local_limit_returns_invalid_argument(self):
+        client = LocalClientConnection(
+            reader=None,
+            writer=FakeLocalWriter(),
+            outbound_maxsize=1,
+            response_max_line_bytes=400,
+        )
+
+        await self.server._controller_command_and_reply(client, schema_query(seq=93))
+
+        response = queued_payloads(client)[0]
+        self.assertEqual(response["status"], "error")
+        self.assertEqual(response["error"]["code"], ErrorCode.INVALID_ARGUMENT.value)
+        self.assertIn("retry with args.board_id", response["error"]["message"])
+        self.assertEqual(self.board_writer.messages, [])
 
     async def test_malformed_json_returns_structured_error(self):
         obs = ObservabilityQueue(maxsize=10)

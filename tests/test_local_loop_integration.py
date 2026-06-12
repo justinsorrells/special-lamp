@@ -225,6 +225,32 @@ class LocalLoopIntegrationTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
+    async def test_schema_discovery_is_local_only_and_does_not_touch_board_tcp(self):
+        await self.start_stack(auto_respond=True)
+        reader, writer = await self.connect_local_client()
+        try:
+            await self.send_local(
+                writer,
+                client_command(
+                    seq=46,
+                    target="controller",
+                    command="get_schemas",
+                    args={"board_id": "motor"},
+                ),
+            )
+            _, response = await read_raw_json_line(reader)
+
+            self.assertEqual(response["status"], "ok")
+            self.assertEqual(response["seq"], 46)
+            self.assertEqual(response["result"]["boards"][0]["board_id"], "motor")
+            self.assertEqual(response["result"]["boards"][0]["schema_revision"], 1)
+            self.assertTrue(self.board_server.commands.empty())
+            self.assertEqual(self.controller.pending_count(), 0)
+            self.assertEqual(self.controller.in_flight_for("motor"), None)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+
     async def test_malformed_local_client_message_returns_structured_error(self):
         await self.start_stack(auto_respond=True)
         reader, writer = await self.connect_local_client()

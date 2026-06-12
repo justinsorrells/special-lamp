@@ -1,8 +1,16 @@
 import asyncio
+import copy
 import unittest
 
 from controller import ControllerCore
-from protocol import BOARD_MAX_LINE_BYTES, ErrorCode, MessageType, ProtocolValidationError, parse_message
+from protocol import (
+    BOARD_MAX_LINE_BYTES,
+    ErrorCode,
+    MessageType,
+    ProtocolValidationError,
+    parse_message,
+    validate_message,
+)
 from state import BoardConnState
 from tests.conftest import (
     FakeBoardWriter,
@@ -12,6 +20,15 @@ from tests.conftest import (
     ok_response,
     schema_for,
 )
+
+
+def schema_query(seq=90, args=None):
+    return client_command(
+        seq=seq,
+        target="controller",
+        command="get_schemas",
+        args={} if args is None else args,
+    )
 
 
 class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
@@ -705,6 +722,183 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.DISCONNECTED)
         self.assertFalse(controller.state.boards["motor"].estop_ack)
         self.assertEqual(writer.messages, [])
+
+    async def test_get_schemas_returns_all_configured_boards_sorted_with_never_registered(self):
+        controller = self.make_controller(boards={"motor", "aux"})
+        self.register_motor(controller)
+
+        response = await controller.route_command(schema_query(seq=90))
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["seq"], 90)
+        boards = response["result"]["boards"]
+        self.assertEqual([record["board_id"] for record in boards], ["aux", "motor"])
+        self.assertEqual(
+            boards[0],
+            {
+                "board_id": "aux",
+                "known": False,
+                "available": False,
+                "conn_state": BoardConnState.DISCONNECTED.value,
+                "schema_revision": 0,
+                "protocol_version": None,
+                "firmware_version": None,
+                "schema": None,
+            },
+        )
+        self.assertTrue(boards[1]["known"])
+        self.assertTrue(boards[1]["available"])
+        self.assertEqual(boards[1]["schema_revision"], 1)
+        self.assertEqual(boards[1]["protocol_version"], "1")
+        self.assertTrue(boards[1]["schema"]["commands"]["legacy_motion"]["blocked_by_estop"])
+        self.assertEqual(controller.pending_count(), 0)
+        self.assertEqual(controller.in_flight_for("motor"), None)
+
+    async def test_get_schemas_filter_returns_one_record_and_cached_schema_after_disconnect(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+        await controller.board_down("motor")
+
+        response = await controller.route_command(schema_query(args={"board_id": "motor"}))
+
+        self.assertEqual(response["status"], "ok")
+        boards = response["result"]["boards"]
+        self.assertEqual(len(boards), 1)
+        self.assertEqual(boards[0]["board_id"], "motor")
+        self.assertTrue(boards[0]["known"])
+        self.assertFalse(boards[0]["available"])
+        self.assertEqual(boards[0]["conn_state"], BoardConnState.FAULTED.value)
+        self.assertEqual(boards[0]["schema_revision"], 1)
+        self.assertIsNotNone(boards[0]["schema"])
+        self.assertEqual(writer.messages, [])
+
+    async def test_get_schemas_validation_and_unknown_local_command(self):
+        controller = self.make_controller()
+
+        extra = await controller.route_command(schema_query(args={"extra": True}))
+        non_string = await controller.route_command(schema_query(args={"board_id": 7}))
+        unknown_board = await controller.route_command(schema_query(args={"board_id": "missing"}))
+        unknown_command = await controller.route_command(
+            client_command(seq=91, target="controller", command="missing", args={})
+        )
+
+        self.assertEqual(extra["error"]["code"], ErrorCode.INVALID_ARGUMENT.value)
+        self.assertEqual(non_string["error"]["code"], ErrorCode.INVALID_ARGUMENT.value)
+        self.assertEqual(unknown_board["error"]["code"], ErrorCode.UNKNOWN_TARGET.value)
+        self.assertEqual(unknown_command["error"]["code"], ErrorCode.UNKNOWN_COMMAND.value)
+
+    async def test_get_schemas_succeeds_during_estop_and_does_not_touch_board_writer_or_seq(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+        controller.state.system.latch_estop()
+
+        response = await controller.route_command(schema_query(seq=92))
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["seq"], 92)
+        self.assertEqual(writer.messages, [])
+        self.assertEqual(controller.pending_count(), 0)
+        self.assertEqual(controller.fifo_depth_for("motor"), 0)
+        self.assertEqual(controller.in_flight_for("motor"), None)
+        self.assertEqual(controller._boards["motor"].seq_counter.next_value, 1)
+
+    async def test_effective_schema_copy_materializes_estop_gate_without_mutating_stored_schema(self):
+        controller = self.make_controller()
+        raw_schema = schema_for("motor")
+        stored_before = copy.deepcopy(raw_schema)
+        controller.register_board("motor", writer=FakeBoardWriter(), schema=raw_schema)
+
+        response = await controller.route_command(schema_query())
+        returned_schema = response["result"]["boards"][0]["schema"]
+        returned_schema["commands"]["legacy_motion"]["blocked_by_estop"] = False
+
+        self.assertEqual(raw_schema, stored_before)
+        self.assertNotIn(
+            "blocked_by_estop",
+            controller.state.boards["motor"].schema["schema"]["commands"]["legacy_motion"],
+        )
+        second = await controller.route_command(schema_query())
+        self.assertTrue(
+            second["result"]["boards"][0]["schema"]["commands"]["legacy_motion"]["blocked_by_estop"]
+        )
+
+    async def test_schema_revision_changes_only_for_effective_record_changes_and_emits_event(self):
+        controller = self.make_controller()
+        events = []
+
+        async def collect(event):
+            events.append(event)
+
+        controller.set_local_event_sink(collect)
+        writer = self.register_motor(controller)
+        await async_wait_for(lambda: len(events) == 1)
+
+        controller.register_board("motor", writer=writer, schema=schema_for("motor"))
+        equivalent = schema_for("motor")
+        equivalent["schema"]["commands"]["legacy_motion"]["blocked_by_estop"] = True
+        controller.register_board("motor", writer=writer, schema=equivalent)
+        changed = schema_for("motor")
+        changed["schema"]["commands"]["new_status"] = {"args": {}, "blocked_by_estop": False}
+        controller.register_board("motor", writer=writer, schema=changed)
+        await async_wait_for(lambda: len(events) == 2)
+
+        self.assertEqual(controller.state.boards["motor"].schema_revision, 2)
+        self.assertEqual([event["event"] for event in events], ["schema_updated", "schema_updated"])
+        self.assertEqual(events[0]["details"], {"board_id": "motor", "schema_revision": 1})
+        self.assertEqual(events[1]["details"], {"board_id": "motor", "schema_revision": 2})
+        for event in events:
+            validate_message(event)
+
+    async def test_firmware_version_change_increments_revision(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+        changed = schema_for("motor")
+        changed["schema"]["firmware_version"] = "0.2.0"
+
+        controller.register_board("motor", writer=writer, schema=changed)
+        response = await controller.route_command(schema_query())
+
+        self.assertEqual(controller.state.boards["motor"].schema_revision, 2)
+        self.assertEqual(response["result"]["boards"][0]["firmware_version"], "0.2.0")
+
+    async def test_protocol_version_mismatch_leaves_schema_revision_untouched(self):
+        controller = self.make_controller()
+        writer = self.register_motor(controller)
+        bad_schema = schema_for("motor")
+        bad_schema["protocol_version"] = "2"
+
+        with self.assertRaises(ProtocolValidationError):
+            controller.register_board("motor", writer=writer, schema=bad_schema)
+
+        response = await controller.route_command(schema_query())
+        self.assertEqual(response["result"]["boards"][0]["schema_revision"], 1)
+        self.assertEqual(response["result"]["boards"][0]["protocol_version"], "1")
+
+    async def test_schema_query_size_limit_fails_all_board_response_but_allows_filtered(self):
+        controller = self.make_controller(boards={"aux", "motor"})
+        controller.register_board("motor", writer=FakeBoardWriter(), schema=schema_for("motor"))
+        controller.register_board("aux", writer=FakeBoardWriter(), schema=schema_for("aux"))
+
+        filtered = controller.route_controller_local_command(
+            schema_query(args={"board_id": "motor"}),
+            max_response_line_bytes=600,
+        )
+        aggregate = controller.route_controller_local_command(
+            schema_query(),
+            max_response_line_bytes=600,
+        )
+        filtered_too_large = controller.route_controller_local_command(
+            schema_query(args={"board_id": "motor"}),
+            max_response_line_bytes=200,
+        )
+
+        self.assertEqual(filtered["status"], "ok")
+        self.assertEqual(aggregate["status"], "error")
+        self.assertEqual(aggregate["error"]["code"], ErrorCode.INVALID_ARGUMENT.value)
+        self.assertIn("retry with args.board_id", aggregate["error"]["message"])
+        self.assertEqual(filtered_too_large["status"], "error")
+        self.assertEqual(filtered_too_large["error"]["code"], ErrorCode.INVALID_ARGUMENT.value)
+        self.assertIn("Individual board schema", filtered_too_large["error"]["message"])
 
 
 class SerializedWriterSmokeTest(unittest.IsolatedAsyncioTestCase):
