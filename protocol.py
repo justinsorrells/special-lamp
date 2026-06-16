@@ -176,23 +176,23 @@ def validate_message(message: dict[str, Any]) -> None:
             ErrorCode.INVALID_TYPE,
             f"unsupported message type {msg_type!r}",
         ) from exc
-
-    if kind is MessageType.COMMAND:
-        _validate_command(message)
-    elif kind is MessageType.RESPONSE:
-        _validate_response(message)
-    elif kind is MessageType.TELEMETRY:
-        _validate_telemetry(message)
-    elif kind is MessageType.SCHEMA:
-        _validate_schema(message)
-    elif kind is MessageType.EVENT:
-        _validate_event(message)
-    elif kind is MessageType.ESTOP:
-        _validate_estop(message)
-    elif kind is MessageType.ESTOP_RESET:
-        _validate_estop_reset(message)
-    elif kind is MessageType.HEARTBEAT:
-        _validate_heartbeat(message)
+    match kind:
+        case MessageType.COMMAND:
+            _validate_command(message)
+        case MessageType.RESPONSE:
+            _validate_response(message)
+        case MessageType.TELEMETRY:
+            _validate_telemetry(message)
+        case MessageType.SCHEMA:
+            _validate_schema(message)
+        case MessageType.EVENT:
+            _validate_event(message)
+        case MessageType.ESTOP:
+            _validate_estop(message)
+        case MessageType.ESTOP_RESET:
+            _validate_estop_reset(message)
+        case MessageType.HEARTBEAT:
+            _validate_heartbeat(message)
 
 
 def command_blocked_by_estop(command_meta: dict[str, Any]) -> bool:

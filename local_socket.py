@@ -29,7 +29,6 @@ from protocol import (
 LOCAL_REQUEST_MAX_LINE_BYTES = CONTROLLER_MAX_LINE_BYTES
 LOCAL_RESPONSE_MAX_LINE_BYTES = DEFAULT_LOCAL_RESPONSE_MAX_LINE_BYTES
 
-
 @dataclass(frozen=True)
 class _OutboundMessage:
     message: dict[str, Any]

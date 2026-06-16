@@ -1218,4 +1218,108 @@ General rules for every task:
   mypy .
   ```
 
+---
+
+* [ ] Task: Audit + harden the Phase-16 demo controller work (post-demo cleanup)
+
+  ## Context
+
+  A fast operator-run Phase-16 interop demo (2026-06-14/15) brought the real
+  controller live against a real Teensy 4.1, added a web GUI, wired Redis telemetry
+  observability, and surfaced several controller-side findings under time pressure.
+  This task is a thorough, unrushed audit of everything done and thought about on
+  the **controller side**, plus additional integration testing (the full hardware
+  rig is available). Full session record (in the firmware repo):
+  `~/cuddly-train/tests/hardware/results/2026-06-14-phase16-interop/INTEGRATION_BRIEF.md`
+  (sections 4–5 are controller-specific). Read it first.
+
+  ## New artifacts to review (added this session, under `demos/`)
+
+  * `demos/webapp_dashboard.py` — schema-driven FastAPI mission-control GUI:
+    persistent Unix-socket link with seq-correlated requests; schema→typed forms
+    with **server-side type coercion** before send (bad input → `BAD_INPUT`, never
+    forwarded); overwrite-by-field "registers" store; telemetry read from Redis
+    (`board:telemetry:<id>` + `/api/history`); board/system state from Redis hashes;
+    connection liveness derived from **telemetry freshness** (`age_s`), not just
+    `conn_state`; full dark industrial redesign. Audit for: correctness of the
+    seq/Future correlation and reconnect, no command-path bypass of the controller,
+    Redis read-only usage, input validation, and that it never becomes a source of
+    truth.
+  * `demos/run_controller_redis.py` — launcher that wires a `redis.asyncio` client
+    via the public `create_runtime(config, redis=...)` seam (because
+    `runtime.main()` passes `redis=None`). Audit whether the controller should
+    optionally wire Redis itself (config-driven) rather than via a demo launcher.
+  * `demos/webapp_dashboard.README.md`.
+  * `redis` 8.0.0 was pip-installed into the venv but is **not in
+    `requirements.txt`/`requirements-dev.txt`** — decide where it belongs (the GUI is
+    a demo; the controller's observability worker also needs an async client to
+    actually populate Redis).
+
+  > Not from this session: the tracked diffs to `local_socket.py` / `protocol.py`
+  > and the untracked `docs/contracts/Teensy_Command_Server_Contract.md` are
+  > pre-existing operator edits — review separately, don't attribute to the demo.
+
+  ## Controller findings to investigate/decide (observed, not yet fixed)
+
+  1. **E-stop events are not forwarded to local clients.**
+     `_emit_controller_event(..., broadcast_local=True)` is used exactly once
+     (schema-change on registration); `estop_triggered`/`estop_ack` go only to
+     observability (`observe_controller_event`). Yet `local_socket.py` lists them as
+     critical event names. Decide whether a GUI/client should see e-stop via the
+     socket and, if so, broadcast them (without putting Redis or new statuses in the
+     path). The demo had to prove e-stop via a wire proxy because of this.
+  2. **`runtime.py` wires `redis=None`** → the documented Redis observability path is
+     inert out of the box. Decide on first-class, config-driven Redis wiring.
+  3. **`get_schemas` does not expose `last_telemetry`** though the controller owns it
+     in board state; consider a read-only current-state surface so a client can show
+     latest telemetry without Redis (Redis stays the fan-out for history/streaming).
+  4. **Single-client board session can wedge (HIGH priority).** During the demo the
+     controller⇄board TCP session sat **half-open ~116 s** (no telemetry, board stuck
+     `CONNECTING`) and did **not** self-recover until an external connection forced
+     the board's newest-connection-wins replacement. Telemetry-based liveness only
+     faults a **`REGISTERED`** board, so a board stuck in the
+     `CONNECTING`/registration-timeout loop has **no watchdog**. Likely a half-open
+     TCP socket with no RST/FIN reaching the controller. Recommended fixes to
+     evaluate: **TCP keepalive on the board connection** (highest leverage — drops
+     half-open sockets), a bounded recovery/abort path for boards stuck `CONNECTING`
+     too long, and force-closing the prior connection before each reconnect attempt.
+  5. **Socket-unlink race on restart:** a killed controller's async shutdown can
+     `unlink` `/tmp/...sock` *after* a new controller binds it, leaving the new one
+     on an orphaned fd. Make shutdown unlink only its own socket, or have startup
+     re-bind robustly; add a runbook note (kill → wait → rm → start exactly one).
+
+  ## Additional integration testing to add (full hardware rig available)
+
+  * End-to-end controller⇄board tests against the conformance firmware (the demo did
+    this ad hoc): schema-first registration, command routing + correlated response,
+    telemetry-driven liveness, disconnect/reconnect + schema re-registration, e-stop
+    chain, and `estop_active` latch + `estop_reset`. Promote the ad-hoc
+    `phase16_demo.py`/proxy approach into a repeatable harness.
+  * **Resilience suite:** rapid reconnect churn, two-clients-one-board contention,
+    half-open/abandoned TCP peer, telemetry stall → liveness fault → recovery; assert
+    bounded recovery (the wedge in finding #4 must not reproduce).
+  * Redis observability assertions: telemetry/state mirrored correctly and capped;
+    Redis outage/latency never blocks command dispatch or e-stop (existing invariant
+    — add a hardware-path test).
+  * GUI/API tests for `webapp_dashboard.py`: schema→form generation, type coercion,
+    `BAD_INPUT` rejection, overwrite-by-field, freshness→offline, history endpoint.
+
+  ## Preserve
+
+  * Frozen architecture: client → Unix socket → controller → TCP → board; controller
+    is sole authority; Redis observability/read-replica only; terminal statuses only
+    `ok`/`error`/`timeout`; new failure modes are error codes; `seq` vs `board_seq`
+    distinct; connection state ⟂ e-stop state. Do not edit `docs/contracts/`,
+    `AGENTS.md`, or `.agents/skills/` without explicit permission.
+
+  ## Validation
+
+  ```bash
+  python -m pytest
+  python tools/check_invariants.py
+  ruff check .
+  mypy .
+  ```
+  plus the recorded operator hardware integration run.
+
 
