@@ -37,6 +37,13 @@ LOGGER = logging.getLogger(__name__)
 DEFAULT_CONFIG_ENV = "HYPERLOOP_CONTROLLER_CONFIG"
 
 
+class _RedisUnset:
+    pass
+
+
+_REDIS_UNSET = _RedisUnset()
+
+
 class BoardConnectionLike(Protocol):
     def start(self) -> None:
         ...
@@ -87,6 +94,7 @@ class RuntimeConfig:
     default_execution_timeout_s: float = DEFAULT_COMMAND_TIMEOUT_S
     default_queue_residency_cap_s: float = DEFAULT_QUEUE_RESIDENCY_CAP_S
     local_outbound_queue_size: int = 1000
+    connect_timeout_s: float = 2.0
     registration_timeout_s: float = 2.0
     shutdown_drain_timeout_s: float = DEFAULT_SHUTDOWN_DRAIN_TIMEOUT_S
     shutdown_close_timeout_s: float = DEFAULT_SHUTDOWN_CLOSE_TIMEOUT_S
@@ -98,6 +106,7 @@ class RuntimeConfig:
     observability_enabled: bool = True
     observability_queue_size: int = DEFAULT_OBS_QUEUE_SIZE
     observability_stream_maxlen: int = DEFAULT_STREAM_MAXLEN
+    redis_url: str | None = None
 
     def __post_init__(self) -> None:
         if not self.socket_path:
@@ -110,6 +119,7 @@ class RuntimeConfig:
         _require_positive("default_execution_timeout_s", self.default_execution_timeout_s)
         _require_positive("default_queue_residency_cap_s", self.default_queue_residency_cap_s)
         _require_positive("local_outbound_queue_size", self.local_outbound_queue_size)
+        _require_positive("connect_timeout_s", self.connect_timeout_s)
         _require_positive("registration_timeout_s", self.registration_timeout_s)
         _require_positive("shutdown_drain_timeout_s", self.shutdown_drain_timeout_s)
         _require_positive("shutdown_close_timeout_s", self.shutdown_close_timeout_s)
@@ -142,6 +152,7 @@ class RuntimeConfig:
                 DEFAULT_QUEUE_RESIDENCY_CAP_S,
             ),
             local_outbound_queue_size=_int(controller, "local_outbound_queue_size", 1000),
+            connect_timeout_s=_float(controller, "connect_timeout_s", 2.0),
             registration_timeout_s=_float(controller, "registration_timeout_s", 2.0),
             shutdown_drain_timeout_s=_float(
                 controller,
@@ -173,6 +184,7 @@ class RuntimeConfig:
                 "stream_maxlen",
                 DEFAULT_STREAM_MAXLEN,
             ),
+            redis_url=_optional_string(observability, "redis_url"),
         )
 
 
@@ -277,7 +289,16 @@ def load_runtime_config(path: str | os.PathLike[str]) -> RuntimeConfig:
     return RuntimeConfig.from_mapping(data)
 
 
-def create_runtime(config: RuntimeConfig, *, redis: Any | None = None) -> ControllerRuntime:
+def create_runtime(
+    config: RuntimeConfig,
+    *,
+    redis: Any | None | _RedisUnset = _REDIS_UNSET,
+) -> ControllerRuntime:
+    redis_client: Any | None
+    if isinstance(redis, _RedisUnset):
+        redis_client = _redis_from_config(config)
+    else:
+        redis_client = redis
     obs_queue = (
         ObservabilityQueue(maxsize=config.observability_queue_size)
         if config.observability_enabled
@@ -285,7 +306,7 @@ def create_runtime(config: RuntimeConfig, *, redis: Any | None = None) -> Contro
     )
     obs_worker = (
         RedisTelemetryWorker(
-            redis=redis,
+            redis=redis_client,
             obs_queue=obs_queue,
             stream_maxlen=config.observability_stream_maxlen,
         )
@@ -308,6 +329,7 @@ def create_runtime(config: RuntimeConfig, *, redis: Any | None = None) -> Contro
                 factor=config.reconnect_factor,
                 cap_delay_s=config.reconnect_cap_delay_s,
             ),
+            connect_timeout_s=config.connect_timeout_s,
             registration_timeout_s=config.registration_timeout_s,
             heartbeat=config.heartbeat,
             liveness=config.liveness,
@@ -326,6 +348,16 @@ def create_runtime(config: RuntimeConfig, *, redis: Any | None = None) -> Contro
         board_connections=board_connections,
         observability_worker=obs_worker,
     )
+
+
+def _redis_from_config(config: RuntimeConfig) -> Any | None:
+    if not config.observability_enabled or config.redis_url is None:
+        return None
+    try:
+        import redis.asyncio as aioredis
+    except ImportError as exc:
+        raise RuntimeError("observability.redis_url requires the 'redis' package") from exc
+    return aioredis.from_url(config.redis_url, decode_responses=True)
 
 
 def install_signal_handlers(
@@ -390,6 +422,17 @@ def _string(mapping: dict[str, Any], key: str) -> str:
     value = mapping.get(key)
     if not isinstance(value, str):
         raise ValueError(f"{key} must be a string")
+    return value
+
+
+def _optional_string(mapping: dict[str, Any], key: str) -> str | None:
+    value = mapping.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    if value == "":
+        return None
     return value
 
 

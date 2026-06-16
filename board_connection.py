@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
@@ -136,6 +137,7 @@ class BoardTCPConnection:
         reconnect_delay_s: float | None = None,
         reconnect_backoff: ReconnectBackoff | None = None,
         registration_timeout_s: float = 2.0,
+        connect_timeout_s: float = 2.0,
         heartbeat: HeartbeatConfig | None = None,
         liveness: LivenessConfig | None = None,
     ):
@@ -153,6 +155,9 @@ class BoardTCPConnection:
             )
         )
         self.registration_timeout_s = registration_timeout_s
+        if connect_timeout_s <= 0:
+            raise ValueError("connect timeout must be positive")
+        self.connect_timeout_s = connect_timeout_s
         self.heartbeat = HeartbeatConfig() if heartbeat is None else heartbeat
         self.liveness = LivenessConfig() if liveness is None else liveness
         self._stop = asyncio.Event()
@@ -202,15 +207,22 @@ class BoardTCPConnection:
         self._registered.clear()
         self._last_inbound_at = None
         self._liveness_fault_reported = False
+        await self._close_previous_stream_writer()
         self.controller.set_board_state(self.endpoint.board_id, BoardConnState.CONNECTING)
         reader: asyncio.StreamReader | None = None
         raw_writer: asyncio.StreamWriter | None = None
         try:
-            reader, raw_writer = await asyncio.open_connection(
-                self.endpoint.host,
-                self.endpoint.port,
-                limit=CONTROLLER_MAX_LINE_BYTES,
+            connected_reader, connected_writer = await asyncio.wait_for(
+                asyncio.open_connection(
+                    self.endpoint.host,
+                    self.endpoint.port,
+                    limit=CONTROLLER_MAX_LINE_BYTES,
+                ),
+                timeout=self.connect_timeout_s,
             )
+            reader = connected_reader
+            raw_writer = connected_writer
+            self._enable_tcp_keepalive(raw_writer)
             self.controller.record_reconnect()
             self.controller.set_board_state(self.endpoint.board_id, BoardConnState.CONNECTED)
             stream_writer = StreamBoardWriter(self.endpoint.board_id, raw_writer)
@@ -265,6 +277,38 @@ class BoardTCPConnection:
             if not self._stop.is_set() and not self._liveness_fault_reported:
                 await self.controller.board_down(self.endpoint.board_id)
 
+    async def _close_previous_stream_writer(self) -> None:
+        writer = self._stream_writer
+        self._stream_writer = None
+        if writer is None:
+            return
+        try:
+            await writer.close()
+        except (ConnectionError, OSError):
+            return
+
+    def _enable_tcp_keepalive(self, writer: asyncio.StreamWriter) -> None:
+        raw_socket = writer.get_extra_info("socket")
+        if raw_socket is None:
+            return
+        try:
+            raw_socket.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+            self._set_tcp_keepalive_option(raw_socket, "TCP_KEEPIDLE", 30)
+            self._set_tcp_keepalive_option(raw_socket, "TCP_KEEPALIVE", 30)
+            self._set_tcp_keepalive_option(raw_socket, "TCP_KEEPINTVL", 10)
+            self._set_tcp_keepalive_option(raw_socket, "TCP_KEEPCNT", 3)
+        except OSError:
+            return
+
+    def _set_tcp_keepalive_option(self, raw_socket: socket.socket, name: str, value: int) -> None:
+        option = getattr(socket, name, None)
+        if option is None:
+            return
+        try:
+            raw_socket.setsockopt(socket.IPPROTO_TCP, option, value)
+        except OSError:
+            return
+
     async def _read_loop(self, reader: asyncio.StreamReader) -> None:
         while not self._stop.is_set():
             message = await self._read_valid_message(reader)
@@ -314,7 +358,6 @@ class BoardTCPConnection:
         elif message_type == MessageType.TELEMETRY.value:
             self.controller.record_board_telemetry(message)
         elif message_type == MessageType.EVENT.value:
-            self.controller.observe_controller_event(message)
             await self._handle_event(message)
         elif message_type == MessageType.SCHEMA.value:
             # A reconnect schema is handled by establishing a fresh connection.
@@ -327,8 +370,11 @@ class BoardTCPConnection:
         if is_estop_ack_event(message):
             board.mark_estop_ack()
             self.controller.observe_board_state_snapshot(self.endpoint.board_id)
+            await self.controller.emit_board_event(message, broadcast_local=True)
         elif message.get("event") == "estop_triggered":
             await self.controller.trigger_estop(origin_board=message.get("source"))
+        else:
+            self.controller.observe_controller_event(message)
 
     def _start_heartbeat(self, writer: StreamBoardWriter) -> None:
         if not self.heartbeat.enabled:

@@ -1,6 +1,8 @@
 import asyncio
+import socket
 import unittest
 from collections import deque
+from unittest.mock import patch
 
 from board_connection import (
     BoardEndpoint,
@@ -246,6 +248,12 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_board_telemetry_and_estop_ack_event_update_state(self):
         obs = ObservabilityQueue(maxsize=20)
         self.controller.observability = obs
+        events = []
+
+        async def collect(event):
+            events.append(event)
+
+        self.controller.set_local_event_sink(collect)
         self.start_connection()
         await self.connection.wait_registered()
 
@@ -273,6 +281,10 @@ class BoardConnectionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             }
         )
         await self.wait_for(lambda: self.controller.state.boards["motor"].estop_ack)
+        await self.wait_for(lambda: any(event["event"] == "estop_ack" for event in events))
+        estop_ack_events = [event for event in events if event["event"] == "estop_ack"]
+        self.assertEqual(len(estop_ack_events), 1)
+        self.assertEqual(estop_ack_events[0]["details"], {"state": "safe"})
 
     async def test_board_telemetry_rate_tracking_updates_over_tcp(self):
         self.start_connection()
@@ -510,6 +522,49 @@ class BoardConnectionUnitTests(unittest.IsolatedAsyncioTestCase):
         wait_task = asyncio.create_task(connection._wait_before_reconnect())
         connection._stop.set()
         await asyncio.wait_for(wait_task, timeout=0.1)
+
+    async def test_connect_attempt_is_bounded_by_connect_timeout(self):
+        async def never_connect(*_args, **_kwargs):
+            await asyncio.Event().wait()
+
+        controller = ControllerCore(expected_boards={"motor"})
+        connection = BoardTCPConnection(
+            BoardEndpoint("motor", "127.0.0.1", 1),
+            controller,
+            connect_timeout_s=0.01,
+            liveness=LivenessConfig(enabled=False),
+        )
+
+        with patch("board_connection.asyncio.open_connection", side_effect=never_connect):
+            await connection._connect_and_read_once()
+
+        self.assertEqual(controller.state.boards["motor"].conn_state, BoardConnState.FAULTED)
+        self.assertEqual(controller.metrics_snapshot()["board_disconnects"], 1)
+
+    async def test_tcp_keepalive_is_enabled_on_connected_socket(self):
+        class FakeSocket:
+            def __init__(self):
+                self.options = []
+
+            def setsockopt(self, level, option, value):
+                self.options.append((level, option, value))
+
+        class FakeWriter:
+            def __init__(self):
+                self.raw_socket = FakeSocket()
+
+            def get_extra_info(self, name):
+                if name == "socket":
+                    return self.raw_socket
+                return None
+
+        controller = ControllerCore(expected_boards={"motor"})
+        connection = BoardTCPConnection(BoardEndpoint("motor", "127.0.0.1", 1), controller)
+        writer = FakeWriter()
+
+        connection._enable_tcp_keepalive(writer)
+
+        self.assertIn((socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1), writer.raw_socket.options)
 
     async def test_successful_registration_resets_reconnect_backoff(self):
         server = FakeBoardTCPServer()

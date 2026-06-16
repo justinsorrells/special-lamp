@@ -189,6 +189,7 @@ class RuntimeConfigTests(unittest.TestCase):
                         default_execution_timeout_s = 1.5
                         default_queue_residency_cap_s = 7.0
                         local_outbound_queue_size = 32
+                        connect_timeout_s = 0.2
                         registration_timeout_s = 0.25
                         shutdown_drain_timeout_s = 0.1
                         shutdown_close_timeout_s = 0.05
@@ -217,6 +218,7 @@ class RuntimeConfigTests(unittest.TestCase):
                         enabled = false
                         queue_size = 10
                         stream_maxlen = 20
+                        redis_url = "redis://127.0.0.1:6379/0"
                         """
                     )
                 )
@@ -229,6 +231,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.default_execution_timeout_s, 1.5)
         self.assertEqual(config.default_queue_residency_cap_s, 7.0)
         self.assertEqual(config.local_outbound_queue_size, 32)
+        self.assertEqual(config.connect_timeout_s, 0.2)
         self.assertEqual(config.registration_timeout_s, 0.25)
         self.assertEqual(config.shutdown_drain_timeout_s, 0.1)
         self.assertEqual(config.shutdown_close_timeout_s, 0.05)
@@ -239,6 +242,7 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(config.heartbeat.suspect_after_misses, 2)
         self.assertFalse(config.liveness.enabled)
         self.assertFalse(config.observability_enabled)
+        self.assertEqual(config.redis_url, "redis://127.0.0.1:6379/0")
 
     def test_config_rejects_missing_boards_and_duplicate_board_ids(self):
         with self.assertRaisesRegex(ValueError, "boards"):
@@ -279,6 +283,33 @@ class RuntimeConfigTests(unittest.TestCase):
         self.assertEqual(len(runtime.board_connections), 2)
         self.assertIsNotNone(runtime.observability_worker)
         self.assertEqual(runtime.controller.observability.queue.maxsize, 3)
+
+    def test_create_runtime_wires_configured_redis_url_outside_command_path(self):
+        config = RuntimeConfig(
+            socket_path="/tmp/hyperloop.sock",
+            boards=(RuntimeBoardConfig("motor", "127.0.0.1", 1001),),
+            observability_enabled=True,
+            redis_url="redis://127.0.0.1:6379/0",
+        )
+
+        runtime = create_runtime(config)
+
+        self.assertIsNotNone(runtime.observability_worker)
+        self.assertIsNotNone(runtime.observability_worker.redis)
+        self.assertIsNotNone(runtime.controller.observability)
+
+    def test_explicit_redis_none_keeps_configured_redis_disabled_for_tests(self):
+        config = RuntimeConfig(
+            socket_path="/tmp/hyperloop.sock",
+            boards=(RuntimeBoardConfig("motor", "127.0.0.1", 1001),),
+            observability_enabled=True,
+            redis_url="redis://127.0.0.1:6379/0",
+        )
+
+        runtime = create_runtime(config, redis=None)
+
+        self.assertIsNotNone(runtime.observability_worker)
+        self.assertIsNone(runtime.observability_worker.redis)
 
 
 class RuntimeLifecycleTests(unittest.IsolatedAsyncioTestCase):

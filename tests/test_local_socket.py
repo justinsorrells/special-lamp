@@ -313,6 +313,19 @@ class LocalSocketTests(unittest.IsolatedAsyncioTestCase):
             writer.close()
             await writer.wait_closed()
 
+    async def test_stop_only_unlinks_socket_path_owned_by_this_server(self):
+        os.unlink(self.socket_path)
+        replacement = await asyncio.start_unix_server(lambda _reader, _writer: None, path=self.socket_path)
+        try:
+            await self.server.stop()
+
+            self.assertTrue(os.path.exists(self.socket_path))
+        finally:
+            replacement.close()
+            await replacement.wait_closed()
+            if os.path.exists(self.socket_path):
+                os.unlink(self.socket_path)
+
     async def test_valid_command_routes_through_controller_and_returns_same_client_response(self):
         reader, writer = await self.connect_client()
         try:

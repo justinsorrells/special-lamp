@@ -733,19 +733,16 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response["seq"], 90)
         boards = response["result"]["boards"]
         self.assertEqual([record["board_id"] for record in boards], ["aux", "motor"])
-        self.assertEqual(
-            boards[0],
-            {
-                "board_id": "aux",
-                "known": False,
-                "available": False,
-                "conn_state": BoardConnState.DISCONNECTED.value,
-                "schema_revision": 0,
-                "protocol_version": None,
-                "firmware_version": None,
-                "schema": None,
-            },
-        )
+        self.assertEqual(boards[0]["board_id"], "aux")
+        self.assertFalse(boards[0]["known"])
+        self.assertFalse(boards[0]["available"])
+        self.assertEqual(boards[0]["conn_state"], BoardConnState.DISCONNECTED.value)
+        self.assertEqual(boards[0]["schema_revision"], 0)
+        self.assertIsNone(boards[0]["protocol_version"])
+        self.assertIsNone(boards[0]["firmware_version"])
+        self.assertIsNone(boards[0]["schema"])
+        self.assertIsNone(boards[0]["last_telemetry"])
+        self.assertFalse(boards[0]["estop_ack"])
         self.assertTrue(boards[1]["known"])
         self.assertTrue(boards[1]["available"])
         self.assertEqual(boards[1]["schema_revision"], 1)
@@ -753,6 +750,29 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(boards[1]["schema"]["commands"]["legacy_motion"]["blocked_by_estop"])
         self.assertEqual(controller.pending_count(), 0)
         self.assertEqual(controller.in_flight_for("motor"), None)
+
+    async def test_get_schemas_exposes_read_only_current_board_telemetry(self):
+        controller = self.make_controller()
+        self.register_motor(controller)
+        controller.record_board_telemetry(
+            {
+                "type": "telemetry",
+                "seq": 100,
+                "source": "motor",
+                "target": "controller",
+                "telemetry": {"rpm": 321},
+            },
+            received_at=123.0,
+        )
+
+        response = await controller.route_command(schema_query(args={"board_id": "motor"}))
+        board = response["result"]["boards"][0]
+        board["last_telemetry"]["rpm"] = 999
+
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(board["last_seen"], 123.0)
+        self.assertEqual(board["telemetry_sample_count"], 1)
+        self.assertEqual(controller.state.boards["motor"].last_telemetry, {"rpm": 321})
 
     async def test_get_schemas_filter_returns_one_record_and_cached_schema_after_disconnect(self):
         controller = self.make_controller()
@@ -849,6 +869,61 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
         for event in events:
             validate_message(event)
 
+    async def test_estop_trigger_and_reset_are_broadcast_to_local_clients(self):
+        controller = self.make_controller()
+        self.register_motor(controller)
+        events = []
+
+        async def collect(event):
+            events.append(event)
+
+        controller.set_local_event_sink(collect)
+
+        await controller.trigger_estop(origin_board="motor")
+        reset = controller.reset_estop(
+            {
+                "type": "estop_reset",
+                "seq": 77,
+                "source": "gui",
+                "target": "controller",
+            }
+        )
+        await async_wait_for(lambda: len(events) == 2)
+
+        self.assertEqual(reset["status"], "ok")
+        self.assertEqual([event["event"] for event in events], ["estop_triggered", "estop_reset"])
+        self.assertEqual(events[0]["details"], {"origin_board": "motor"})
+        self.assertEqual(events[1]["details"], {"source": "gui"})
+
+    async def test_board_event_broadcast_waits_for_async_local_sink(self):
+        controller = self.make_controller()
+        seen = []
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def collect(event):
+            started.set()
+            await release.wait()
+            seen.append(event)
+
+        event = {
+            "type": MessageType.EVENT.value,
+            "source": "motor",
+            "target": "controller",
+            "event": "estop_ack",
+            "details": {"state": "safe"},
+        }
+        controller.set_local_event_sink(collect)
+        task = asyncio.create_task(controller.emit_board_event(event, broadcast_local=True))
+
+        await asyncio.wait_for(started.wait(), timeout=0.1)
+        self.assertFalse(task.done())
+        self.assertEqual(seen, [])
+
+        release.set()
+        await asyncio.wait_for(task, timeout=0.1)
+        self.assertEqual(seen, [event])
+
     async def test_firmware_version_change_increments_revision(self):
         controller = self.make_controller()
         writer = self.register_motor(controller)
@@ -881,11 +956,11 @@ class ControllerCoreTests(unittest.IsolatedAsyncioTestCase):
 
         filtered = controller.route_controller_local_command(
             schema_query(args={"board_id": "motor"}),
-            max_response_line_bytes=600,
+            max_response_line_bytes=900,
         )
         aggregate = controller.route_controller_local_command(
             schema_query(),
-            max_response_line_bytes=600,
+            max_response_line_bytes=900,
         )
         filtered_too_large = controller.route_controller_local_command(
             schema_query(args={"board_id": "motor"}),

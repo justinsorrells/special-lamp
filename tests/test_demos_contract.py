@@ -11,6 +11,7 @@ from board_connection import BoardEndpoint, BoardTCPConnection, LivenessConfig
 from controller import ControllerCore
 from demos.client.client import DEFAULT_CLIENT_SEQ, UnixSocketDemoClient
 from demos.server.server import MockBoardServer
+from demos.webapp_dashboard import ControllerLink, _coerce
 from local_socket import LocalUnixSocketServer
 from protocol import BOARD_MAX_LINE_BYTES, ErrorCode, MessageType, parse_message, serialize_message
 from tests.conftest import FakeStreamWriter
@@ -281,6 +282,42 @@ class DemoClientUnitTests(unittest.TestCase):
 
         self.assertEqual(client._next_seq(), DEFAULT_CLIENT_SEQ)
         self.assertNotEqual(DEFAULT_CLIENT_SEQ, 1)
+
+
+class DashboardUnitTests(unittest.IsolatedAsyncioTestCase):
+    async def test_estop_reset_uses_seq_correlated_request(self) -> None:
+        link = ControllerLink("/tmp/not-used.sock")
+        writer = FakeStreamWriter()
+        link._writer = cast(Any, writer)
+        link.connected = True
+
+        task = asyncio.create_task(link.send_estop_reset())
+        while not writer.messages():
+            await asyncio.sleep(0)
+        request = writer.messages()[0]
+        link._dispatch(
+            {
+                "type": MessageType.RESPONSE.value,
+                "seq": request["seq"],
+                "source": "controller",
+                "target": "webapp",
+                "status": "ok",
+                "result": {"estop_active": False},
+                "error": None,
+            }
+        )
+        response = await asyncio.wait_for(task, timeout=0.5)
+
+        self.assertEqual(request["type"], MessageType.ESTOP_RESET.value)
+        self.assertEqual(request["target"], "controller")
+        self.assertEqual(response["status"], "ok")
+        self.assertEqual(response["seq"], request["seq"])
+
+    def test_bool_coercion_rejects_ambiguous_values_before_forwarding(self) -> None:
+        self.assertTrue(_coerce("true", "bool"))
+        self.assertFalse(_coerce("false", "bool"))
+        with self.assertRaises(ValueError):
+            _coerce("maybe", "bool")
 
 
 class DemoSourceInvariantTests(unittest.TestCase):

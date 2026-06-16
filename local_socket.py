@@ -29,6 +29,7 @@ from protocol import (
 LOCAL_REQUEST_MAX_LINE_BYTES = CONTROLLER_MAX_LINE_BYTES
 LOCAL_RESPONSE_MAX_LINE_BYTES = DEFAULT_LOCAL_RESPONSE_MAX_LINE_BYTES
 
+
 @dataclass(frozen=True)
 class _OutboundMessage:
     message: dict[str, Any]
@@ -189,6 +190,7 @@ class LocalUnixSocketServer:
         self.clients: set[LocalClientConnection] = set()
         self.client_event_dropped = 0
         self.critical_event_disconnects = 0
+        self._owned_socket: tuple[int, int] | None = None
         self.controller.set_local_event_sink(self.broadcast_event)
 
     async def start(self) -> None:
@@ -199,6 +201,8 @@ class LocalUnixSocketServer:
             limit=LOCAL_REQUEST_MAX_LINE_BYTES,
         )
         os.chmod(self.socket_path, 0o600)
+        stat_result = os.stat(self.socket_path)
+        self._owned_socket = (stat_result.st_dev, stat_result.st_ino)
 
     async def stop(self) -> None:
         if self.server is not None:
@@ -207,8 +211,9 @@ class LocalUnixSocketServer:
             self.server = None
         await asyncio.gather(*(client.close() for client in list(self.clients)), return_exceptions=True)
         self.clients.clear()
-        if os.path.exists(self.socket_path):
+        if self._owns_socket_path():
             os.unlink(self.socket_path)
+        self._owned_socket = None
 
     async def broadcast_event(self, event: dict[str, Any], *, critical: bool | None = None) -> None:
         validate_message(event)
@@ -232,6 +237,15 @@ class LocalUnixSocketServer:
             os.unlink(self.socket_path)
             return
         raise RuntimeError(f"live controller already owns {self.socket_path}")
+
+    def _owns_socket_path(self) -> bool:
+        if self._owned_socket is None:
+            return False
+        try:
+            stat_result = os.stat(self.socket_path)
+        except FileNotFoundError:
+            return False
+        return self._owned_socket == (stat_result.st_dev, stat_result.st_ino)
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         client = LocalClientConnection(

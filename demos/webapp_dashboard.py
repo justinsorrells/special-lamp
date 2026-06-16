@@ -48,7 +48,12 @@ def _coerce(value: Any, type_name: str) -> Any:
     if type_name == "bool":
         if isinstance(value, bool):
             return value
-        return str(value).strip().lower() in ("1", "true", "on", "yes")
+        normalized = str(value).strip().lower()
+        if normalized in ("1", "true", "on", "yes"):
+            return True
+        if normalized in ("0", "false", "off", "no"):
+            return False
+        raise ValueError(f"{value!r} is not a valid bool")
     return str(value)
 
 
@@ -173,6 +178,8 @@ class ControllerLink:
             pass
         finally:
             self.connected = False
+            self._reader = None
+            self._writer = None
 
     def _dispatch(self, message: dict[str, Any]) -> None:
         mtype = message.get("type")
@@ -205,6 +212,28 @@ class ControllerLink:
 
     async def send(self, *, target: str, command: str, args: dict[str, Any],
                    absorb: bool = True) -> dict[str, Any]:
+        return await self._request(
+            {
+                "type": MessageType.COMMAND.value,
+                "source": "webapp",
+                "target": target,
+                "command": command,
+                "args": args,
+            },
+            absorb=absorb,
+        )
+
+    async def send_estop_reset(self) -> dict[str, Any]:
+        return await self._request(
+            {
+                "type": MessageType.ESTOP_RESET.value,
+                "source": "webapp",
+                "target": CONTROLLER_TARGET,
+            },
+            absorb=False,
+        )
+
+    async def _request(self, message: dict[str, Any], *, absorb: bool = True) -> dict[str, Any]:
         async with self._lock:
             await self._ensure_connection()
             if self._writer is None:
@@ -212,16 +241,20 @@ class ControllerLink:
                                                      "message": self.last_error or "not connected"}}
             self._seq += 1
             seq = self._seq
+            message = {**message, "seq": seq}
             if not absorb:
                 self._no_absorb_seqs.add(seq)
             loop = asyncio.get_running_loop()
             fut: asyncio.Future[dict[str, Any]] = loop.create_future()
             self._pending[seq] = fut
-            self._writer.write(serialize_message(
-                {"type": MessageType.COMMAND.value, "seq": seq, "source": "webapp",
-                 "target": target, "command": command, "args": args},
-                max_line_bytes=CONTROLLER_MAX_LINE_BYTES))
-            await self._writer.drain()
+            try:
+                self._writer.write(serialize_message(message, max_line_bytes=CONTROLLER_MAX_LINE_BYTES))
+                await self._writer.drain()
+            except (ConnectionError, OSError) as exc:
+                self._pending.pop(seq, None)
+                self.connected = False
+                self.last_error = f"send failed: {exc}"
+                return {"status": "error", "error": {"code": "NO_CONTROLLER", "message": self.last_error}}
         try:
             return await asyncio.wait_for(fut, timeout=3.0)
         except (asyncio.TimeoutError, TimeoutError):
@@ -303,6 +336,14 @@ def build_app(socket_path: str, redis_url: str | None = None) -> FastAPI:
         command = payload.get("command", "")
         raw_args = payload.get("args", {}) or {}
         types = _arg_types(target, command)
+        if types is None:
+            return JSONResponse({"status": "error", "error": {
+                "code": "BAD_INPUT", "message": "unknown target or command"}})
+        extra_args = set(raw_args) - set(types)
+        if extra_args:
+            name = sorted(extra_args)[0]
+            return JSONResponse({"status": "error", "error": {
+                "code": "BAD_INPUT", "message": f"{name!r} is not a declared argument"}})
         coerced: dict[str, Any] = {}
         for name, raw in raw_args.items():
             try:
@@ -315,16 +356,7 @@ def build_app(socket_path: str, redis_url: str | None = None) -> FastAPI:
 
     @app.post("/api/estop_reset")
     async def api_estop_reset() -> JSONResponse:
-        async with link._lock:  # noqa: SLF001 - demo
-            await link._ensure_connection()
-            link._seq += 1
-            seq = link._seq
-            link._writer.write(serialize_message(
-                {"type": MessageType.ESTOP_RESET.value, "seq": seq,
-                 "source": "webapp", "target": CONTROLLER_TARGET},
-                max_line_bytes=CONTROLLER_MAX_LINE_BYTES))
-            await link._writer.drain()
-        return JSONResponse({"status": "sent"})
+        return JSONResponse(await link.send_estop_reset())
 
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
@@ -333,12 +365,14 @@ def build_app(socket_path: str, redis_url: str | None = None) -> FastAPI:
     return app
 
 
-def _arg_types(target: str, command: str) -> dict[str, str]:
+def _arg_types(target: str, command: str) -> dict[str, str] | None:
     for board in link.boards:
         if board.get("board_id") == target:
             cmd = (board.get("schema") or {}).get("commands", {}).get(command, {})
+            if not cmd:
+                return None
             return dict(cmd.get("args", {}) or {})
-    return {}
+    return None
 
 
 INDEX_HTML = r"""<!doctype html>
@@ -686,4 +720,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

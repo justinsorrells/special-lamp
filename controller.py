@@ -583,13 +583,14 @@ class ControllerCore:
             return
         self.state.system.latch_estop()
         self._observe_system_state()
-        self.observe_controller_event(
+        self.emit_controller_event(
             {
                 "type": MessageType.EVENT.value,
                 "source": "controller",
                 "event": "estop_triggered",
                 "details": {"origin_board": origin_board},
-            }
+            },
+            broadcast_local=True,
         )
         for runtime in self._boards.values():
             while runtime.fifo:
@@ -649,6 +650,15 @@ class ControllerCore:
             )
         self.state.system.operator_reset_estop()
         self._observe_system_state()
+        self.emit_controller_event(
+            {
+                "type": MessageType.EVENT.value,
+                "source": "controller",
+                "event": "estop_reset",
+                "details": {"source": reset_message["source"]},
+            },
+            broadcast_local=True,
+        )
         response = {
             "type": MessageType.RESPONSE.value,
             "seq": reset_message["seq"],
@@ -965,6 +975,13 @@ class ControllerCore:
             "schema_revision": state.schema_revision,
             "protocol_version": None if record is None else record.protocol_version,
             "firmware_version": None if record is None else record.firmware_version,
+            "last_telemetry": copy.deepcopy(state.last_telemetry),
+            "last_seen": state.last_seen,
+            "telemetry_rate_hz": state.telemetry_rate.rate_hz,
+            "telemetry_interval_ms": state.telemetry_rate.last_interval_ms,
+            "telemetry_jitter_ms": state.telemetry_rate.jitter_ms,
+            "telemetry_sample_count": state.telemetry_rate.sample_count,
+            "estop_ack": state.estop_ack,
             "schema": None if record is None else copy.deepcopy(record.effective_schema),
         }
 
@@ -1004,6 +1021,28 @@ class ControllerCore:
                 asyncio.create_task(result)
             except RuntimeError:
                 result.close()
+
+    async def _emit_controller_event_async(
+        self,
+        event: dict[str, Any],
+        *,
+        broadcast_local: bool = False,
+    ) -> None:
+        validate_message(event)
+        self.observe_controller_event(event)
+        if not broadcast_local or self._local_event_sink is None:
+            return
+        result = self._local_event_sink(event)
+        if result is not None:
+            await result
+
+    def emit_controller_event(
+        self,
+        event: dict[str, Any],
+        *,
+        broadcast_local: bool = False,
+    ) -> None:
+        self._emit_controller_event(event, broadcast_local=broadcast_local)
 
     async def _dispatch_next(self, board_id: str) -> None:
         runtime = self._boards[board_id]
@@ -1203,6 +1242,14 @@ class ControllerCore:
 
     def observe_board_state_snapshot(self, board_id: str) -> None:
         self._observe_board_state(self._boards[board_id].state)
+
+    async def emit_board_event(
+        self,
+        event: dict[str, Any],
+        *,
+        broadcast_local: bool = False,
+    ) -> None:
+        await self._emit_controller_event_async(event, broadcast_local=broadcast_local)
 
     def observe_controller_event(self, event: dict[str, Any]) -> None:
         if self.observability is None:
