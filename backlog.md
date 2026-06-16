@@ -1220,7 +1220,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Audit + harden the Phase-16 demo controller work (post-demo cleanup)
+* [x] Task: Audit + harden the Phase-16 demo controller work (post-demo cleanup)
 
   ## Context
 
