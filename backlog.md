@@ -1324,7 +1324,7 @@ General rules for every task:
 
 ---
 
-* [ ] Task: Author an expansive, study-grade codebase reference (one tab per Python file)
+* [x] Task: Author an expansive, study-grade codebase reference (one tab per Python file)
 
   ## Goal
 
