@@ -1,0 +1,625 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Hyperloop Python Codebase Reference</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f8fafc;
+      --ink: #111827;
+      --muted: #4b5563;
+      --line: #d1d5db;
+      --panel: #ffffff;
+      --accent: #075985;
+      --accent-soft: #e0f2fe;
+      --code: #f3f4f6;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.5;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 32px 0 48px;
+    }
+
+    h1,
+    h2,
+    h3 {
+      line-height: 1.2;
+      margin: 0 0 12px;
+    }
+
+    h1 {
+      font-size: 2rem;
+    }
+
+    h2 {
+      font-size: 1.35rem;
+      margin-top: 24px;
+    }
+
+    h3 {
+      font-size: 1.05rem;
+      margin-top: 20px;
+    }
+
+    p {
+      margin: 0 0 12px;
+    }
+
+    ul {
+      margin: 0 0 16px 1.2rem;
+      padding: 0;
+    }
+
+    li {
+      margin: 4px 0;
+    }
+
+    code {
+      background: var(--code);
+      border-radius: 4px;
+      padding: 1px 4px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    a {
+      color: var(--accent);
+    }
+
+    .authority,
+    .orientation,
+    .tab-panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+    }
+
+    .authority {
+      margin: 18px 0;
+      border-left: 4px solid var(--accent);
+    }
+
+    .orientation {
+      margin-bottom: 20px;
+    }
+
+    .tabs {
+      display: grid;
+      grid-template-columns: 260px minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+
+    .tab-input {
+      position: absolute;
+      opacity: 0;
+      pointer-events: none;
+    }
+
+    .tab-list {
+      position: sticky;
+      top: 12px;
+      display: grid;
+      gap: 6px;
+      max-height: calc(100vh - 24px);
+      overflow: auto;
+      padding: 4px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+
+    .tab-list h2 {
+      margin: 10px 8px 4px;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: var(--muted);
+    }
+
+    .tab-list label {
+      display: block;
+      padding: 8px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.86rem;
+    }
+
+    .tab-list label:hover {
+      background: var(--code);
+      color: var(--ink);
+    }
+
+    .tab-panels {
+      min-width: 0;
+    }
+
+    .tab-panel {
+      display: none;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: 0 0 16px;
+    }
+
+    .meta span {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      padding: 3px 9px;
+      color: var(--muted);
+      font-size: 0.84rem;
+      background: #fbfdff;
+    }
+
+    .note-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .note-grid section {
+      min-width: 0;
+    }
+
+    #tab-protocol:checked ~ .tabs label[for="tab-protocol"],
+    #tab-state:checked ~ .tabs label[for="tab-state"],
+    #tab-interfaces:checked ~ .tabs label[for="tab-interfaces"],
+    #tab-controller:checked ~ .tabs label[for="tab-controller"],
+    #tab-board-connection:checked ~ .tabs label[for="tab-board-connection"],
+    #tab-local-socket:checked ~ .tabs label[for="tab-local-socket"],
+    #tab-observability:checked ~ .tabs label[for="tab-observability"],
+    #tab-runtime:checked ~ .tabs label[for="tab-runtime"],
+    #tab-demo-client:checked ~ .tabs label[for="tab-demo-client"],
+    #tab-demo-run-controller-redis:checked ~ .tabs label[for="tab-demo-run-controller-redis"],
+    #tab-demo-server:checked ~ .tabs label[for="tab-demo-server"],
+    #tab-demo-webapp:checked ~ .tabs label[for="tab-demo-webapp"],
+    #tab-demo-webapp-dashboard:checked ~ .tabs label[for="tab-demo-webapp-dashboard"],
+    #tab-test-agent-orchestrator:checked ~ .tabs label[for="tab-test-agent-orchestrator"],
+    #tab-test-board-connection:checked ~ .tabs label[for="tab-test-board-connection"],
+    #tab-test-check-invariants:checked ~ .tabs label[for="tab-test-check-invariants"],
+    #tab-test-companion-docs:checked ~ .tabs label[for="tab-test-companion-docs"],
+    #tab-test-controller-core:checked ~ .tabs label[for="tab-test-controller-core"],
+    #tab-test-demos-contract:checked ~ .tabs label[for="tab-test-demos-contract"],
+    #tab-test-local-loop-integration:checked ~ .tabs label[for="tab-test-local-loop-integration"],
+    #tab-test-local-socket:checked ~ .tabs label[for="tab-test-local-socket"],
+    #tab-test-observability:checked ~ .tabs label[for="tab-test-observability"],
+    #tab-test-protocol-contracts:checked ~ .tabs label[for="tab-test-protocol-contracts"],
+    #tab-test-runtime:checked ~ .tabs label[for="tab-test-runtime"],
+    #tab-tests-conftest:checked ~ .tabs label[for="tab-tests-conftest"],
+    #tab-tools-check-invariants:checked ~ .tabs label[for="tab-tools-check-invariants"],
+    #tab-tools-agent-orchestrator:checked ~ .tabs label[for="tab-tools-agent-orchestrator"] {
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-weight: 700;
+    }
+
+    #tab-protocol:checked ~ .tabs [data-python-file="protocol.py"],
+    #tab-state:checked ~ .tabs [data-python-file="state.py"],
+    #tab-interfaces:checked ~ .tabs [data-python-file="interfaces.py"],
+    #tab-controller:checked ~ .tabs [data-python-file="controller.py"],
+    #tab-board-connection:checked ~ .tabs [data-python-file="board_connection.py"],
+    #tab-local-socket:checked ~ .tabs [data-python-file="local_socket.py"],
+    #tab-observability:checked ~ .tabs [data-python-file="observability.py"],
+    #tab-runtime:checked ~ .tabs [data-python-file="runtime.py"],
+    #tab-demo-client:checked ~ .tabs [data-python-file="demos/client/client.py"],
+    #tab-demo-run-controller-redis:checked ~ .tabs [data-python-file="demos/run_controller_redis.py"],
+    #tab-demo-server:checked ~ .tabs [data-python-file="demos/server/server.py"],
+    #tab-demo-webapp:checked ~ .tabs [data-python-file="demos/webapp.py"],
+    #tab-demo-webapp-dashboard:checked ~ .tabs [data-python-file="demos/webapp_dashboard.py"],
+    #tab-test-agent-orchestrator:checked ~ .tabs [data-python-file="tests/test_agent_orchestrator.py"],
+    #tab-test-board-connection:checked ~ .tabs [data-python-file="tests/test_board_connection.py"],
+    #tab-test-check-invariants:checked ~ .tabs [data-python-file="tests/test_check_invariants.py"],
+    #tab-test-companion-docs:checked ~ .tabs [data-python-file="tests/test_companion_docs.py"],
+    #tab-test-controller-core:checked ~ .tabs [data-python-file="tests/test_controller_core.py"],
+    #tab-test-demos-contract:checked ~ .tabs [data-python-file="tests/test_demos_contract.py"],
+    #tab-test-local-loop-integration:checked ~ .tabs [data-python-file="tests/test_local_loop_integration.py"],
+    #tab-test-local-socket:checked ~ .tabs [data-python-file="tests/test_local_socket.py"],
+    #tab-test-observability:checked ~ .tabs [data-python-file="tests/test_observability.py"],
+    #tab-test-protocol-contracts:checked ~ .tabs [data-python-file="tests/test_protocol_contracts.py"],
+    #tab-test-runtime:checked ~ .tabs [data-python-file="tests/test_runtime.py"],
+    #tab-tests-conftest:checked ~ .tabs [data-python-file="tests/conftest.py"],
+    #tab-tools-check-invariants:checked ~ .tabs [data-python-file="tools/check_invariants.py"],
+    #tab-tools-agent-orchestrator:checked ~ .tabs [data-python-file="tools/agent_orchestrator/orchestrate.py"] {
+      display: block;
+    }
+
+    @media (max-width: 860px) {
+      main {
+        width: min(100% - 20px, 1180px);
+        padding-top: 20px;
+      }
+
+      .tabs {
+        grid-template-columns: 1fr;
+      }
+
+      .tab-list {
+        position: static;
+        max-height: none;
+      }
+
+      .note-grid {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Hyperloop Python Codebase Reference</h1>
+  <p>This study-grade reference gives one tab to every tracked Python source file in the repository. It is companion material, not a protocol extension.</p>
+
+  <section class="authority">
+    <h2>Authority</h2>
+    <p>The frozen controller/networking contract <a href="../contracts/V1_Networking_Decisions.md">docs/contracts/V1_Networking_Decisions.md</a> remains authoritative, and <a href="../contracts/Board_Developer_Guide.md">docs/contracts/Board_Developer_Guide.md</a> governs firmware-facing behavior. If this companion reference disagrees with either, the frozen contracts win.</p>
+  </section>
+
+  <section class="orientation">
+    <h2>How To Study The Stack</h2>
+    <ul>
+      <li>Start with <code>protocol.py</code>, <code>state.py</code>, and <code>interfaces.py</code>; these are the shared contract primitives.</li>
+      <li>Read <code>controller.py</code> before transport files. It owns dispatch, pending resolution, e-stop gating, and shutdown behavior.</li>
+      <li>Read <code>board_connection.py</code> and <code>local_socket.py</code> as adapters around the controller core: TCP boards on one side, full-duplex local Unix clients on the other.</li>
+      <li>Keep the topology in view: <code>local client -&gt; Unix socket -&gt; asyncio controller -&gt; persistent TCP -&gt; board</code>. Redis remains observability/read-replica only.</li>
+    </ul>
+  </section>
+
+  <input class="tab-input" type="radio" name="python-file" id="tab-protocol" checked>
+  <input class="tab-input" type="radio" name="python-file" id="tab-state">
+  <input class="tab-input" type="radio" name="python-file" id="tab-interfaces">
+  <input class="tab-input" type="radio" name="python-file" id="tab-controller">
+  <input class="tab-input" type="radio" name="python-file" id="tab-board-connection">
+  <input class="tab-input" type="radio" name="python-file" id="tab-local-socket">
+  <input class="tab-input" type="radio" name="python-file" id="tab-observability">
+  <input class="tab-input" type="radio" name="python-file" id="tab-runtime">
+  <input class="tab-input" type="radio" name="python-file" id="tab-demo-client">
+  <input class="tab-input" type="radio" name="python-file" id="tab-demo-run-controller-redis">
+  <input class="tab-input" type="radio" name="python-file" id="tab-demo-server">
+  <input class="tab-input" type="radio" name="python-file" id="tab-demo-webapp">
+  <input class="tab-input" type="radio" name="python-file" id="tab-demo-webapp-dashboard">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-agent-orchestrator">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-board-connection">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-check-invariants">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-companion-docs">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-controller-core">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-demos-contract">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-local-loop-integration">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-local-socket">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-observability">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-protocol-contracts">
+  <input class="tab-input" type="radio" name="python-file" id="tab-test-runtime">
+  <input class="tab-input" type="radio" name="python-file" id="tab-tests-conftest">
+  <input class="tab-input" type="radio" name="python-file" id="tab-tools-check-invariants">
+  <input class="tab-input" type="radio" name="python-file" id="tab-tools-agent-orchestrator">
+
+  <div class="tabs">
+    <nav class="tab-list" aria-label="Python files">
+      <h2>Core</h2>
+      <label for="tab-protocol">protocol.py</label>
+      <label for="tab-state">state.py</label>
+      <label for="tab-interfaces">interfaces.py</label>
+      <label for="tab-controller">controller.py</label>
+      <label for="tab-board-connection">board_connection.py</label>
+      <label for="tab-local-socket">local_socket.py</label>
+      <label for="tab-observability">observability.py</label>
+      <label for="tab-runtime">runtime.py</label>
+      <h2>Demos</h2>
+      <label for="tab-demo-client">demos/client/client.py</label>
+      <label for="tab-demo-run-controller-redis">demos/run_controller_redis.py</label>
+      <label for="tab-demo-server">demos/server/server.py</label>
+      <label for="tab-demo-webapp">demos/webapp.py</label>
+      <label for="tab-demo-webapp-dashboard">demos/webapp_dashboard.py</label>
+      <h2>Tests</h2>
+      <label for="tab-test-agent-orchestrator">tests/test_agent_orchestrator.py</label>
+      <label for="tab-test-board-connection">tests/test_board_connection.py</label>
+      <label for="tab-test-check-invariants">tests/test_check_invariants.py</label>
+      <label for="tab-test-companion-docs">tests/test_companion_docs.py</label>
+      <label for="tab-test-controller-core">tests/test_controller_core.py</label>
+      <label for="tab-test-demos-contract">tests/test_demos_contract.py</label>
+      <label for="tab-test-local-loop-integration">tests/test_local_loop_integration.py</label>
+      <label for="tab-test-local-socket">tests/test_local_socket.py</label>
+      <label for="tab-test-observability">tests/test_observability.py</label>
+      <label for="tab-test-protocol-contracts">tests/test_protocol_contracts.py</label>
+      <label for="tab-test-runtime">tests/test_runtime.py</label>
+      <label for="tab-tests-conftest">tests/conftest.py</label>
+      <h2>Tools</h2>
+      <label for="tab-tools-check-invariants">tools/check_invariants.py</label>
+      <label for="tab-tools-agent-orchestrator">tools/agent_orchestrator/orchestrate.py</label>
+    </nav>
+
+    <div class="tab-panels">
+      <article class="tab-panel" data-python-file="protocol.py">
+        <h2>protocol.py</h2>
+        <p class="meta"><span>Layer: shared primitive</span><span>506 lines</span><span>Read first</span></p>
+        <p>Defines the newline-delimited JSON contract primitives used by every runtime boundary. It deliberately contains no socket, Redis, GUI, or firmware integration, which keeps validation and serialization independent from routing decisions.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>MessageType</code>, <code>TerminalStatus</code>, and <code>ErrorCode</code> are closed contract vocabularies.</li><li><code>parse_line()</code>, <code>parse_message()</code>, and <code>serialize_message()</code> enforce framing and line limits.</li><li><code>build_board_command()</code> rewrites client commands onto the board-facing hop with controller-owned <code>board_seq</code>.</li><li><code>build_client_response()</code> restores the client <code>seq</code> and exposes <code>result.board_seq</code>.</li><li><code>pop_pending()</code> is the shared pop-wins helper for late, duplicate, timeout, and disconnect races.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Client <code>seq</code> and controller <code>board_seq</code> are intentionally separate sequence spaces.</li><li><code>controller_ts</code> is a monotonic round-trip token, not wall-clock time.</li><li><code>blocked_by_estop</code> defaults to true through <code>command_blocked_by_estop()</code>.</li><li>Malformed input becomes structured errors; callers decide whether to reply, disconnect, or log.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="state.py">
+        <h2>state.py</h2>
+        <p class="meta"><span>Layer: shared primitive</span><span>319 lines</span><span>State shapes</span></p>
+        <p>Holds the in-memory controller state and Redis mirror schemas without performing I/O. This is the best place to understand the two orthogonal axes: per-board connection state and global/per-board safety state.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>BoardConnState</code> is the frozen connection axis: disconnected, connecting, connected, registered, faulted.</li><li><code>SystemState.estop_active</code> is the global latch cleared only by operator reset.</li><li><code>BoardState.estop_ack</code> tracks per-board convergence and is not a dispatch gate.</li><li><code>PendingCommand</code> stores board/client sequence mapping plus timeout budgets.</li><li><code>BoardStateRecord</code> and <code>SystemStateRecord</code> describe Redis mirror payloads.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li><code>PendingCommand.__post_init__()</code> enforces the 10 s execution-timeout ceiling.</li><li>Latency and telemetry rate observations use controller-side measurements.</li><li><code>ControllerState.refresh_connected_count()</code> derives connected count from registered board states.</li><li>Redis records expose current values; they are not authority objects.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="interfaces.py">
+        <h2>interfaces.py</h2>
+        <p class="meta"><span>Layer: shared primitive</span><span>101 lines</span><span>Injection seams</span></p>
+        <p>Defines the protocol-style handoff boundaries between controller components. These seams keep the command path decoupled from concrete sockets, Redis clients, and local-client implementations.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>ClientReplyHandle</code> centralizes response/event delivery to local clients.</li><li><code>BoardDownHandler</code> is the connection-manager-to-dispatcher drain hook.</li><li><code>BoardWriterHandle</code> exposes the serialized per-board write boundary.</li><li><code>SerializedBoardWriter</code> wraps a byte-writing callback with newline-JSON serialization and an <code>asyncio.Lock</code>.</li><li><code>send_estop()</code> routes out-of-band e-stop through the same writer handle as normal commands.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li><code>send_estop()</code> bypasses command FIFO and in-flight ownership, but not socket-byte serialization.</li><li><code>deliver_client_response()</code> is where orphaned local-client responses are counted.</li><li>This module should stay free of concrete TCP, Unix socket, Redis, and GUI imports.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="controller.py">
+        <h2>controller.py</h2>
+        <p class="meta"><span>Layer: controller core</span><span>1353 lines</span><span>Dispatch owner</span></p>
+        <p>Implements the in-memory asyncio controller core. It owns command routing, per-board FIFO behavior, pending resolution, e-stop latching/gating, board-down drains, schema discovery for local clients, lifecycle counters, and graceful shutdown.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>ControllerCore</code> is the central dispatcher and state owner.</li><li><code>register_board()</code> validates schema protocol version, stores blocked-by-estop metadata, and moves a board to <code>REGISTERED</code>.</li><li><code>handle_client_command()</code> routes controller-local commands or board commands.</li><li><code>handle_board_response()</code> uses pop-wins to resolve pending board responses.</li><li><code>handle_estop_triggered()</code>, <code>handle_estop_reset()</code>, and <code>shutdown()</code> implement safety and lifecycle flows.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Only one command can be in flight per board; additional commands enter bounded FIFOs or fail with <code>BOARD_BUSY</code>.</li><li>Queued commands have a residency cap; execution timeout starts only after board write.</li><li>In-flight commands are not synthetically failed on e-stop because they may already have physical effects.</li><li>Observability is injected. The command path must not depend on Redis availability.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="board_connection.py">
+        <h2>board_connection.py</h2>
+        <p class="meta"><span>Layer: board TCP adapter</span><span>521 lines</span><span>Persistent board transport</span></p>
+        <p>Maintains controller-to-board TCP connections. Boards are the TCP servers; this module connects to configured endpoints, requires schema as the first message, forwards unsolicited telemetry/events, and reports disconnects back to the controller core.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>BoardEndpoint</code> identifies one statically configured board server.</li><li><code>ReconnectBackoff</code> implements exponential full-jitter reconnect delay.</li><li><code>StreamBoardWriter</code> serializes command/e-stop writes to one board stream.</li><li><code>BoardTCPConnection</code> owns connect, registration, read loop, heartbeat, liveness, and reconnect.</li><li><code>HeartbeatConfig</code> and <code>LivenessConfig</code> make optional RX insurance and telemetry liveness explicit.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>The controller accepts board inbound lines up to 8 KiB; controller outbound commands must fit the board's 1 KiB limit.</li><li>Registration fails if the first message is not a schema or the board ID/version is wrong.</li><li><code>event: estop_ack</code> is unsolicited and flips <code>board.estop_ack</code> through the controller.</li><li>On read failure or disconnect, <code>board_down()</code> lets the controller fail pending/FIFO entries with <code>BOARD_UNAVAILABLE</code>.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="local_socket.py">
+        <h2>local_socket.py</h2>
+        <p class="meta"><span>Layer: local Unix socket adapter</span><span>404 lines</span><span>Full-duplex clients</span></p>
+        <p>Implements the local client boundary over Unix sockets. Local clients send newline-JSON requests and must continuously read both request-correlated responses and unsolicited controller events.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>LocalClientConnection</code> owns one reader/writer pair and one bounded outbound queue.</li><li><code>writer_loop()</code> serializes outbound responses/events without blocking the server fan-out.</li><li><code>_evict_oldest_noncritical()</code> preserves order while dropping non-critical events under pressure.</li><li><code>LocalUnixSocketServer</code> owns socket lifecycle, client registration, request dispatch, and broadcast.</li><li><code>_is_critical_event()</code> keeps e-stop/safety events and responses from being silently dropped.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Per-client outbound queues isolate slow clients from the command path and other clients.</li><li>Non-critical events are drop-oldest; critical saturation disconnects the client.</li><li>The socket path is protected against stale files and live-controller conflicts.</li><li>This module never talks directly to boards.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="observability.py">
+        <h2>observability.py</h2>
+        <p class="meta"><span>Layer: observability</span><span>322 lines</span><span>Redis side channel</span></p>
+        <p>Contains the bounded observability queue, best-effort Redis writer, and serializers for board state, system state, telemetry, controller events, and command lifecycle records.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>ObservabilityQueue</code> provides non-awaiting drop-oldest enqueue behavior.</li><li><code>ObservabilityCounters</code> tracks dropped observability records and Redis failures.</li><li><code>RedisTelemetryWorker</code> drains records and writes hashes, pub/sub deltas, and capped streams.</li><li><code>serialize_command_lifecycle()</code> validates terminal statuses before telemetry records are emitted.</li><li><code>_redis_value()</code> normalizes hash values to strings.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Redis is a read-replica/logging target only; failures are counted and logged, not raised into dispatch.</li><li>The observability overflow policy is intentionally the opposite of command FIFO behavior.</li><li><code>redis=None</code> is a supported disabled mode for tests and local operation.</li><li>Serialization preserves connection state and safety state as separate fields.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="runtime.py">
+        <h2>runtime.py</h2>
+        <p class="meta"><span>Layer: process composition</span><span>466 lines</span><span>Startup/shutdown</span></p>
+        <p>Composes the controller core, board TCP connections, local Unix socket server, and optional observability worker into a process runtime. It also loads TOML configuration and installs signal handlers.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>RuntimeBoardConfig</code> and <code>RuntimeConfig</code> describe process configuration.</li><li><code>ControllerRuntime</code> owns lifecycle ordering for components.</li><li><code>load_runtime_config()</code> parses TOML into typed config objects.</li><li><code>create_runtime()</code> wires concrete controller, board, local socket, and observability instances.</li><li><code>install_signal_handlers()</code> schedules shutdown from SIGINT/SIGTERM.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Startup waits for components that must be ready, but reconnecting board tasks keep retrying forever.</li><li>Shutdown is idempotent and delegates command draining to the controller core.</li><li>Redis construction is optional and isolated from command-path code.</li><li>Configuration helpers validate positive numeric values and typed mappings up front.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="demos/client/client.py">
+        <h2>demos/client/client.py</h2>
+        <p class="meta"><span>Layer: demo client</span><span>207 lines</span><span>Unix socket CLI</span></p>
+        <p>Provides a command-line local client that connects to the controller Unix socket, sends one command or watches events, and prints JSON responses. It demonstrates the expected full-duplex local-client behavior.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>UnixSocketDemoClient</code> wraps connect, send, receive, and close operations.</li><li><code>run_once()</code> sends a single command and returns the matching response.</li><li><code>watch_events()</code> continuously prints unsolicited events/responses from the socket.</li><li><code>_parse_args()</code> and <code>_coerce_value()</code> turn CLI args into JSON command args.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>The demo goes through the Unix socket and never contacts board TCP endpoints.</li><li>It uses compact protocol messages so examples stay close to the real client boundary.</li><li>Watching events is not optional for production clients; e-stop and state events can arrive without request correlation.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="demos/run_controller_redis.py">
+        <h2>demos/run_controller_redis.py</h2>
+        <p class="meta"><span>Layer: demo launcher</span><span>48 lines</span><span>Runtime wrapper</span></p>
+        <p>Small command-line entry point for running the controller runtime with Redis configuration. It keeps demo startup logic out of the core runtime module.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>main()</code> delegates config loading and runtime execution.</li><li>Argument parsing selects the runtime configuration file.</li><li>Exit codes reflect startup/config/runtime failures.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>This is a composition demo, not a separate controller implementation.</li><li>Redis remains optional observability infrastructure; the command topology is unchanged.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="demos/server/server.py">
+        <h2>demos/server/server.py</h2>
+        <p class="meta"><span>Layer: demo board</span><span>354 lines</span><span>Mock TCP board</span></p>
+        <p>Implements a mock board TCP server for local testing and demonstrations. It pushes schema on connect, sends telemetry, handles registered commands, and emits e-stop acknowledgements after applying local mock safe state.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>MockCommand</code> describes command args and e-stop blocking metadata.</li><li><code>MockBoardState</code> stores simple board-local telemetry/state.</li><li><code>MockBoardServer</code> owns TCP accept, schema push, telemetry loop, command handling, and e-stop handling.</li><li><code>run_server()</code>, <code>build_parser()</code>, and <code>main()</code> provide the CLI entry point.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>The mock board is a TCP server, matching the frozen topology.</li><li>Telemetry is pushed without solicitation.</li><li>The schema declares <code>blocked_by_estop</code> for commands so controller gating can be exercised.</li><li>Oversized/malformed inbound behavior belongs to board-side protocol expectations.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="demos/webapp.py">
+        <h2>demos/webapp.py</h2>
+        <p class="meta"><span>Layer: minimal web demo</span><span>106 lines</span><span>FastAPI demo</span></p>
+        <p>Provides a tiny FastAPI example that sends controller-local commands through the Unix socket. It is intentionally minimal and stays outside the controller internals.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>send_controller_command()</code> opens a local Unix socket request/response exchange.</li><li><code>index()</code> returns a compact HTML form.</li><li><code>run()</code>, <code>build_parser()</code>, and <code>main()</code> host the demo with uvicorn.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>The web demo uses the same local-client boundary as any GUI.</li><li>It should not import or call board TCP code directly.</li><li>For richer state/event handling, study <code>demos/webapp_dashboard.py</code>.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="demos/webapp_dashboard.py">
+        <h2>demos/webapp_dashboard.py</h2>
+        <p class="meta"><span>Layer: dashboard demo</span><span>722 lines</span><span>FastAPI dashboard</span></p>
+        <p>Implements a richer web dashboard demo around the local controller socket and optional Redis observability. It exposes board schemas, command forms, state snapshots, event streams, and diagnostics without changing the command path.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>ControllerLink</code> manages the Unix socket connection used by the dashboard.</li><li><code>build_app()</code> assembles FastAPI routes and background tasks.</li><li><code>_coerce()</code> and <code>_arg_types()</code> help map schema argument types into submitted command args.</li><li>Routes expose schemas, state, command submission, and event streaming.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>The dashboard must learn board capabilities from controller-local schema discovery.</li><li>Redis data is read as observability state and cannot authorize or complete commands.</li><li>Command submission still goes through the Unix socket to the controller.</li><li>UI state should react to unsolicited e-stop and board-state events.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_agent_orchestrator.py">
+        <h2>tests/test_agent_orchestrator.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>862 lines</span><span>Workflow-tool coverage</span></p>
+        <p>Tests the multi-agent orchestration tool rather than the controller runtime. It focuses on configuration parsing, command policy, subprocess timeout handling, Git status parsing, diff extraction, and orchestration phase behavior.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>TestAgentOrchestrator</code> covers the tool's parsing, policy, and orchestration helpers.</li><li>Temporary files and mocked subprocess calls keep tests isolated from real agent execution.</li><li>Git parsing tests document how status and diff output drive commit-scope decisions.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>This test suite is intentionally separate from networking invariants.</li><li>Never-auto policy tests are safety checks for automation behavior.</li><li>Failures here usually indicate workflow-tool drift, not controller protocol drift.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_board_connection.py">
+        <h2>tests/test_board_connection.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>838 lines</span><span>Board TCP coverage</span></p>
+        <p>Exercises the TCP board adapter against fake servers and unit-level edge cases. It proves schema registration, reconnect, liveness, heartbeat, estop acknowledgement, protocol mismatch, and disconnect behavior.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>FakeBoardTCPServer</code> is the in-test board server.</li><li><code>BoardConnectionIntegrationTests</code> covers real asyncio stream interactions.</li><li><code>ReconnectBackoffTests</code> covers jitter and ceiling math.</li><li><code>BoardConnectionUnitTests</code> covers smaller edge cases.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Use these tests to understand first-message schema registration.</li><li>Disconnect tests show how <code>board_down()</code> transfers ownership back to the controller.</li><li>Heartbeat tests are optional RX-path insurance and should not replace telemetry liveness.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_check_invariants.py">
+        <h2>tests/test_check_invariants.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>287 lines</span><span>Static guard coverage</span></p>
+        <p>Tests the repository invariant checker with both the real repo and synthetic violation fixtures. It protects terminal statuses, error-code synchronization, dependency boundaries, and blocking-call checks.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>RepoPassesInvariantsTests</code> runs all checks against the repository.</li><li><code>SyntheticViolationTests</code> builds small temporary repos to prove each checker catches violations.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>These tests encode architectural constraints that docs alone cannot enforce.</li><li>Failures here often mean a module boundary or contract vocabulary changed unexpectedly.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_companion_docs.py">
+        <h2>tests/test_companion_docs.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>123 lines before this reference</span><span>Docs contract coverage</span></p>
+        <p>Checks companion documentation for contract deference and required coverage. This reference adds synchronization checks so every repository Python file keeps its own tab.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>CompanionDocsTests</code> reads files from <code>docs/companion</code>.</li><li>Existing tests check frozen-topology wording and key contract terms.</li><li>New reference tests compare repository Python files to <code>data-python-file</code> tab panels.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>When adding a Python file, update this reference in the same change.</li><li>Companion docs must defer to frozen contracts and must not invent protocol behavior.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_controller_core.py">
+        <h2>tests/test_controller_core.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>1001 lines</span><span>Controller core coverage</span></p>
+        <p>Contains broad unit coverage for dispatch, FIFO behavior, pending resolution, e-stop, schema discovery, lifecycle counters, latency metrics, and graceful shutdown inside <code>ControllerCore</code>.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>ControllerCoreTests</code> covers the main dispatcher behavior.</li><li><code>schema_query()</code> constructs controller-local schema discovery requests.</li><li><code>SerializedWriterSmokeTest</code> validates shared writer serialization behavior.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>This is the primary test file for pop-wins, queue residency, timeout, shutdown, and e-stop interactions.</li><li>Read failures with the contract section numbers in mind; many tests map directly to frozen decisions.</li><li>Fakes in <code>tests/conftest.py</code> keep async behavior deterministic.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_demos_contract.py">
+        <h2>tests/test_demos_contract.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>338 lines</span><span>Demo boundary coverage</span></p>
+        <p>Validates that demo programs preserve the same contracts as production code. It covers mock board behavior, local-loop demos, CLI coercion, dashboard helpers, and source-level isolation rules.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>DemoMockBoardTests</code> exercises the mock board over TCP.</li><li><code>DemoLocalLoopTests</code> covers demo client/server/controller integration.</li><li><code>DemoClientUnitTests</code> checks CLI argument coercion.</li><li><code>DashboardUnitTests</code> covers dashboard helper behavior.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Demo code is allowed to be user-facing, but not allowed to bypass the frozen topology.</li><li>Source-invariant tests catch direct board access from client-facing demos.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_local_loop_integration.py">
+        <h2>tests/test_local_loop_integration.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>398 lines</span><span>End-to-end local loop</span></p>
+        <p>Runs a local in-process loop with fake board server, controller runtime pieces, and Unix socket client interactions. It proves the full command path without requiring Redis or external hardware.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>FakeLoopBoardServer</code> supplies a board-like TCP endpoint.</li><li><code>LocalLoopIntegrationTests</code> covers successful commands, events, schemas, and lifecycle edges.</li><li><code>read_raw_json_line()</code> keeps stream assertions concise.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>This is the best test to read after the architecture docs because it traverses the whole local-client-to-board path.</li><li>It keeps Redis out of the command path by design.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_local_socket.py">
+        <h2>tests/test_local_socket.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>719 lines</span><span>Unix socket coverage</span></p>
+        <p>Covers the local Unix socket server and per-client outbound backpressure mechanics. It focuses on full-duplex behavior, response/event distinction, malformed input, socket lifecycle, and slow-client handling.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>FakeLocalWriter</code> captures writes and simulates stream state.</li><li><code>LocalSocketBackpressureTests</code> validates critical/non-critical queue behavior.</li><li><code>LocalSocketTests</code> covers socket startup, request dispatch, malformed input, and broadcasts.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Responses and safety events are critical and cannot be silently dropped.</li><li>Non-critical events drop oldest under pressure and increment counters.</li><li>Malformed local messages produce structured errors rather than crashing the server.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_observability.py">
+        <h2>tests/test_observability.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>390 lines</span><span>Redis/telemetry coverage</span></p>
+        <p>Tests the bounded observability queue, serializers, disabled Redis mode, best-effort Redis writes, and lifecycle status validation.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>FakeRedis</code> captures Redis-like operations and can simulate failures.</li><li><code>ObservabilityTests</code> covers queue overflow, worker behavior, serialization, and error handling.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Queue tests prove drop-oldest semantics and exact counter increments.</li><li>Worker tests prove Redis outages stay out of the command path.</li><li>Serializer tests enforce terminal-status discipline for lifecycle records.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_protocol_contracts.py">
+        <h2>tests/test_protocol_contracts.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>569 lines</span><span>Protocol/state/interface coverage</span></p>
+        <p>Tests the shared primitive layer: protocol framing and validation, state dataclasses and records, sequence disambiguation, pop-wins, e-stop message shape, and serialized writer interfaces.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>ProtocolContractTests</code> covers message validation and helpers.</li><li><code>StateContractTests</code> covers state records, timeout ceilings, metrics, and orthogonal axes.</li><li><code>InterfaceContractTests</code> covers writer serialization and client response delivery.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Start here when changing <code>protocol.py</code>, <code>state.py</code>, or <code>interfaces.py</code>.</li><li>Many tests assert the exact vocabulary from the frozen contract.</li><li>Malformed-input cases should return structured errors, not leak exceptions to event loops.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/test_runtime.py">
+        <h2>tests/test_runtime.py</h2>
+        <p class="meta"><span>Layer: tests</span><span>527 lines</span><span>Runtime lifecycle coverage</span></p>
+        <p>Validates runtime configuration parsing, signal-handler wiring, startup/shutdown sequencing, and small integration loops with fake components.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>RuntimeConfigTests</code> covers TOML parsing and validation.</li><li><code>RuntimeLifecycleTests</code> uses fake components to inspect lifecycle ordering.</li><li><code>RuntimeIntegrationTests</code> verifies composed local-loop behavior.</li><li><code>FakeSignalLoop</code> captures signal-handler registrations.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Runtime tests protect idempotent shutdown and bounded lifecycle behavior.</li><li>They use fake components so failures point at composition, not network timing.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tests/conftest.py">
+        <h2>tests/conftest.py</h2>
+        <p class="meta"><span>Layer: test support</span><span>212 lines</span><span>Shared fakes</span></p>
+        <p>Provides reusable helpers and fakes for deterministic async tests. Despite the pytest filename, the suite primarily uses stdlib <code>unittest</code> patterns.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>encode()</code> and <code>ok_response()</code> build newline-JSON test payloads.</li><li><code>make_stream_reader()</code> feeds real <code>asyncio.StreamReader</code> objects.</li><li><code>FakeStreamWriter</code> captures writes and close/drain behavior.</li><li><code>FakeClock</code> supports deterministic timeout tests.</li><li><code>schema_for()</code>, <code>client_command()</code>, and <code>FakeBoardWriter</code> reduce boilerplate.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>Prefer these helpers before adding new bespoke fakes.</li><li>Timeout tests should advance fake clocks or synchronize on events, not sleep for real time.</li><li>Captured writes should be decoded through protocol helpers where possible.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tools/check_invariants.py">
+        <h2>tools/check_invariants.py</h2>
+        <p class="meta"><span>Layer: tool</span><span>453 lines</span><span>Static invariant checker</span></p>
+        <p>Runs AST and text checks that enforce repository-level architecture rules. It catches status vocabulary drift, error-code mismatches, forbidden command-path imports, direct client-to-board coupling, blocking sleeps, and root contract duplication.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>Violation</code> describes one checker finding.</li><li><code>check_terminal_statuses_frozen()</code> enforces <code>ok</code>, <code>error</code>, and <code>timeout</code>.</li><li><code>check_core_command_path_imports()</code> prevents Redis/observability coupling in command-path modules.</li><li><code>check_client_modules_isolated()</code> protects the GUI/local-client boundary.</li><li><code>run_all_checks()</code> is the tool entry point for tests and CLI use.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>This tool is a guardrail for the contracts, not a replacement for tests.</li><li>When it fails, fix the architectural drift rather than weakening the checker.</li><li>Run it after code changes that touch protocol, state, controller, transports, demos, or docs.</li></ul></section>
+        </div>
+      </article>
+
+      <article class="tab-panel" data-python-file="tools/agent_orchestrator/orchestrate.py">
+        <h2>tools/agent_orchestrator/orchestrate.py</h2>
+        <p class="meta"><span>Layer: tool</span><span>1541 lines</span><span>Agent workflow automation</span></p>
+        <p>Implements a local orchestration tool for multi-agent task selection, implementation, review, adjudication, and optional commit handling. It is tooling around the repository, not part of the controller runtime.</p>
+        <div class="note-grid">
+          <section><h3>Key Symbols</h3><ul><li><code>parse_simple_toml()</code> and <code>load_config()</code> load the orchestrator configuration.</li><li><code>validate_never_auto_policy()</code> and <code>command_blocked_by_never_auto_policy()</code> protect commands under never-auto policies.</li><li><code>run_cmd()</code> executes subprocesses with timeout handling.</li><li><code>AgentResult</code> records one agent phase result.</li><li><code>Orchestrator</code> coordinates task selection, implementation, reviews, adjudication, and commits.</li></ul></section>
+          <section><h3>Study Notes</h3><ul><li>This tool has its own operational safety rules distinct from the networking stack.</li><li>It should not be imported by controller runtime code.</li><li>Git helpers are intentionally centralized so workflow policy can be tested.</li><li>Because this is the largest Python file, study it by phase methods rather than top-to-bottom in one pass.</li></ul></section>
+        </div>
+      </article>
+    </div>
+  </div>
+</main>
+</body>
+</html>

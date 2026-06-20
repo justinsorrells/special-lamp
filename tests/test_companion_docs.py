@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import unittest
 from pathlib import Path
 
@@ -13,6 +14,14 @@ COMPANION_DIR = REPO_ROOT / "docs" / "companion"
 class CompanionDocsTests(unittest.TestCase):
     def _read(self, name: str) -> str:
         return (COMPANION_DIR / name).read_text(encoding="utf-8")
+
+    def _repo_python_files(self) -> set[str]:
+        ignored_dirs = {".git", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".venv", "__pycache__"}
+        return {
+            path.relative_to(REPO_ROOT).as_posix()
+            for path in REPO_ROOT.rglob("*.py")
+            if not ignored_dirs.intersection(path.parts)
+        }
 
     def test_companion_docs_exist_and_defer_to_frozen_contracts(self) -> None:
         expected = {
@@ -36,6 +45,7 @@ class CompanionDocsTests(unittest.TestCase):
         text = self._read("README.md")
         for name in (
             "Component_Handoff_Contracts.md",
+            "Codebase_Reference.html",
             "Integration_Guide.md",
             "Local_Client_API.md",
             "Test_Matrix.md",
@@ -121,3 +131,26 @@ class CompanionDocsTests(unittest.TestCase):
         self.assertIn("INVALID_ARGUMENT", text)
         self.assertIn("schema_updated", text)
         self.assertIn("64 KiB", text)
+
+    def test_codebase_reference_has_one_tab_per_python_file(self) -> None:
+        text = self._read("Codebase_Reference.html")
+        panel_files = set(re.findall(r'data-python-file="([^"]+\.py)"', text))
+        input_ids = set(re.findall(r'<input class="tab-input"[^>]+id="([^"]+)"', text))
+        label_ids = set(re.findall(r'<label for="([^"]+)">[^<]+\.py</label>', text))
+
+        self.assertEqual(panel_files, self._repo_python_files())
+        self.assertEqual(input_ids, label_ids)
+        self.assertEqual(len(panel_files), len(input_ids))
+
+    def test_codebase_reference_is_companion_material_and_preserves_invariants(self) -> None:
+        text = self._read("Codebase_Reference.html")
+        self.assertIn("docs/contracts/V1_Networking_Decisions.md", text)
+        self.assertIn("docs/contracts/Board_Developer_Guide.md", text)
+        self.assertIn("frozen contracts win", text)
+        self.assertIn(
+            "local client -&gt; Unix socket -&gt; asyncio controller -&gt; persistent TCP -&gt; board",
+            text,
+        )
+        self.assertIn("Redis remains observability/read-replica only", text)
+        for status in TERMINAL_STATUSES:
+            self.assertIn(f"<code>{status}</code>", text)

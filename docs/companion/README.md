@@ -15,6 +15,7 @@ operator-facing checklists. It does not define new protocol behavior.
 | File | Audience | Purpose |
 |---|---|---|
 | `Component_Handoff_Contracts.md` | Controller implementers | Ownership boundaries between protocol, state, controller, board TCP, local socket, and observability code. |
+| `Codebase_Reference.html` | Implementers and reviewers | Study-grade tabbed reference with one tab for every Python file in the repository. |
 | `Integration_Guide.md` | Integrators and operators | How to add boards, commands, local clients, Redis observability, and shutdown behavior without changing the topology. |
 | `Local_Client_API.md` | Local client authors | Controller-local schema discovery requests, responses, events, validation, and local line limits. |
 | `Test_Matrix.md` | Implementers and reviewers | Boundary conditions that companion changes and future feature work should keep covered. |
