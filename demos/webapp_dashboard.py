@@ -505,6 +505,23 @@ button.btn.ghost{border-color:var(--border);background:var(--panel);color:var(--
 @media(max-width:1180px){.body{grid-template-columns:64px 1fr}.rail{display:none}.nav a span{display:none}.nav .grp{display:none}}
 @media(prefers-reduced-motion:reduce){*{transition:none!important}}
 .flash{animation:fl .9s ease-out}@keyframes fl{from{background:#16324d}to{background:transparent}}
+/* board tabs + summary cards */
+.tabs{display:flex;gap:7px;flex-wrap:wrap;margin:0 2px 14px}
+.tab{font-family:var(--mono);font-size:12px;letter-spacing:.03em;color:var(--t2);background:var(--panel);border:1px solid var(--border);border-radius:7px;padding:8px 14px;cursor:pointer}
+.tab:hover{color:var(--t1);border-color:var(--border-strong)}
+.tab.on{color:var(--accent);border-color:var(--accent);background:#0f2335}
+.sumcard{border:1px solid var(--border);border-left:3px solid var(--ok);border-radius:9px;background:var(--panel2);padding:14px;cursor:pointer;transition:.14s}
+.sumcard:hover{border-color:var(--border-strong)}
+.sumcard.off{border-left-color:var(--crit);opacity:.62;filter:saturate(.5)}
+.sumcard.sel{box-shadow:0 0 0 1px var(--accent) inset;border-left-color:var(--accent)}
+.sumcard .row1{display:flex;align-items:center;gap:10px}
+.sumcard .nm{font-weight:600;letter-spacing:.03em;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sumcard .stat{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:10px;letter-spacing:.1em;color:var(--ok);flex:none}
+.sumcard.off .stat{color:var(--crit)}
+.sumcard .stat .d{width:7px;height:7px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
+.sumcard .meta{color:var(--t3);font-family:var(--mono);font-size:10.5px;margin:5px 0 10px}
+.sumrow{display:flex;justify-content:space-between;font-size:11.5px;padding:3px 0;color:var(--t3);border-top:1px solid #1a2531}
+.sumrow b{color:var(--t1);font-family:var(--mono);font-weight:500}
 </style></head>
 <body><div class="shell">
  <div class="topbar">
@@ -526,6 +543,7 @@ button.btn.ghost{border-color:var(--border);background:var(--panel);color:var(--
   <nav class="nav">
    <div class="grp">OPERATIONS</div>
    <a class="active" data-go="ov"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg><span>Overview</span></a>
+   <a data-go="summary"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span>Summary</span></a>
    <a data-go="boards"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/></svg><span>Boards</span></a>
    <a data-go="tele"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round"><path d="M3 12h4l2-6 4 12 2-6h6"/></svg><span>Telemetry</span></a>
    <a data-go="cmd"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" stroke-linecap="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="m7 9 3 3-3 3M13 15h4"/></svg><span>Commands</span></a>
@@ -541,7 +559,11 @@ button.btn.ghost{border-color:var(--border);background:var(--panel);color:var(--
     <div class="w metric col3"><div class="label">Cmd latency p95</div><div class="val mono" id="m-lat">--</div><div class="ctx" id="m-lat-ctx">p50 -- · p99 --</div></div>
    </div>
 
+   <div class="sec-title" id="summary">SUMMARY <div class="ln"></div></div>
+   <div class="grid" id="board-summary"><div class="empty">Waiting for boards…</div></div>
+
    <div class="sec-title" id="boards">BOARDS &amp; SIGNAL <div class="ln"></div></div>
+   <div class="tabs" id="board-tabs"></div>
    <div class="grid">
     <div class="col5"><div id="devices"><div class="empty"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.75"><rect x="5" y="5" width="14" height="14" rx="2"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg> Waiting for board registration…</div></div></div>
     <div class="col7"><div class="w">
@@ -570,7 +592,7 @@ button.btn.ghost{border-color:var(--border);background:var(--panel);color:var(--
 </div>
 <script>
 const ICONS={};
-let schema=null, board=null, field='telemetry_interval_ms', activity=[], lastEstop=false, schemaSig=null;
+let schema=null, board=null, field='telemetry_interval_ms', activity=[], lastEstop=false, schemaSig=null, tabsSig=null, formsSig=null;
 function el(id){return document.getElementById(id)}
 function tnow(){return new Date().toLocaleTimeString('en-GB')}
 function pill(id,good,val){const p=el(id);p.classList.toggle('good',!!good);p.classList.toggle('bad',!good);if(val!==undefined)el(id+'-v').textContent=val;}
@@ -580,33 +602,66 @@ function renderActivity(){const e=el('events');if(!activity.length){e.innerHTML=
 
 async function loadSchema(){
  try{schema=await (await fetch('/api/schema')).json();}catch(e){return;}
- const f=el('forms');const bs=schema.boards||[];
- if(!bs.length){f.innerHTML='<div class="empty">no boards registered — waiting</div>';schemaSig=null;return;}
- if(!board)board=bs[0].board_id;
- // Only rebuild the console when the schema actually changes, so live typing
- // is not wiped and a re-registration (e.g. after a reflash) is visible.
- const sig=JSON.stringify(bs.map(b=>[b.board_id,b.schema_revision,(b.schema&&b.schema.commands)||{}]));
- if(sig===schemaSig)return;
- const firstLoad=schemaSig===null;schemaSig=sig;
+ renderForms();
+}
+// Command console renders ONE board at a time — the active tab. Only rebuild
+// when the active board or its schema changes, so live typing isn't wiped.
+function renderForms(force){
+ const f=el('forms');if(!f)return;
+ const bs=(schema&&schema.boards)||[];
+ if(!bs.length){f.innerHTML='<div class="empty">no boards registered — waiting</div>';formsSig=null;return;}
+ if(!board||!bs.find(b=>b.board_id===board))board=bs[0].board_id;
+ const b=bs.find(x=>x.board_id===board)||bs[0];
+ const cmds=(b.schema&&b.schema.commands)||{};
+ const sig=JSON.stringify([b.board_id,b.schema_revision,cmds]);
+ if(!force&&sig===formsSig)return;
+ const firstLoad=formsSig===null;formsSig=sig;
  let html='';
- for(const b of bs){const cmds=(b.schema&&b.schema.commands)||{};
-  for(const name of Object.keys(cmds)){const args=cmds[name].args||{};const gated=cmds[name].blocked_by_estop;
-   const crit=name.indexOf('estop')>=0;
-   html+='<div class="cmd'+(gated?' gated':'')+'"><div class="ch"><b>'+name+'</b><span class="tg muted">→ '+b.board_id+(gated?' · gated':'')+'</span></div>';
-   const ks=Object.keys(args);
-   if(ks.length){html+='<div class="fieldrow">';for(const an of ks){const t=args[an];
-     html+='<div><label class="fl">'+an+' · '+t+'</label>'+(t==='bool'
-       ?'<select class="in" data-arg="'+an+'"><option>true</option><option>false</option></select>'
-       :'<input class="in" data-arg="'+an+'" '+((t==='int'||t==='float')?'type="number" step="any" ':'')+'placeholder="'+t+'">')+'</div>';}
-     html+='</div>';}
-   html+='<button class="btn'+(crit?' crit':'')+'" data-send data-target="'+b.board_id+'" data-cmd="'+name+'">'+(crit?'TRIGGER':'SEND')+'</button>';
-   html+='<div class="resp"></div></div>';
-  }}
- f.innerHTML=html;
+ for(const name of Object.keys(cmds)){const args=cmds[name].args||{};const gated=cmds[name].blocked_by_estop;
+  const crit=name.indexOf('estop')>=0;
+  html+='<div class="cmd'+(gated?' gated':'')+'"><div class="ch"><b>'+name+'</b><span class="tg muted">→ '+b.board_id+(gated?' · gated':'')+'</span></div>';
+  const ks=Object.keys(args);
+  if(ks.length){html+='<div class="fieldrow">';for(const an of ks){const t=args[an];
+    html+='<div><label class="fl">'+an+' · '+t+'</label>'+(t==='bool'
+      ?'<select class="in" data-arg="'+an+'"><option>true</option><option>false</option></select>'
+      :'<input class="in" data-arg="'+an+'" '+((t==='int'||t==='float')?'type="number" step="any" ':'')+'placeholder="'+t+'">')+'</div>';}
+    html+='</div>';}
+  html+='<button class="btn'+(crit?' crit':'')+'" data-send data-target="'+b.board_id+'" data-cmd="'+name+'">'+(crit?'TRIGGER':'SEND')+'</button>';
+  html+='<div class="resp"></div></div>';
+ }
+ f.innerHTML=html||'<div class="empty">no commands for this board</div>';
  f.querySelectorAll('[data-send]').forEach(btn=>btn.addEventListener('click',()=>sendCmd(btn)));
- const total=bs.reduce((n,b)=>n+Object.keys((b.schema&&b.schema.commands)||{}).length,0);
- if(!firstLoad){f.classList.remove('flash');void f.offsetWidth;f.classList.add('flash');
-  pushAct('ok','schema updated',total+' commands · rev '+(bs[0].schema_revision));}
+ if(!firstLoad){f.classList.remove('flash');void f.offsetWidth;f.classList.add('flash');}
+}
+// Tab strip: one tab per registered board; click selects the active board.
+function renderTabs(boards){
+ boards=boards||[];const c=el('board-tabs');if(!c)return;
+ if(boards.length&&(!board||!boards.find(b=>b.board_id===board)))board=boards[0].board_id;
+ const sig=JSON.stringify([boards.map(b=>b.board_id),board]);
+ if(sig===tabsSig)return;tabsSig=sig;
+ c.innerHTML=boards.map(b=>'<button class="tab'+(b.board_id===board?' on':'')+'" data-tab="'+b.board_id+'">'+b.board_id+'</button>').join('');
+ c.querySelectorAll('[data-tab]').forEach(btn=>btn.addEventListener('click',()=>selectBoard(btn.dataset.tab)));
+}
+function selectBoard(bid){
+ if(!bid||board===bid)return;board=bid;tabsSig=null;
+ renderTabs((schema&&schema.boards)||[]);renderForms(true);drawChart();poll();
+}
+// Summary section: a compact status card for EVERY board, always visible.
+function renderSummary(s){
+ const c=el('board-summary');if(!c)return;const bs=s.boards||[];
+ if(!bs.length){c.innerHTML='<div class="empty">no boards registered — waiting</div>';return;}
+ c.innerHTML=bs.map(b=>{const bid=b.board_id;const tel=(s.telemetry||{})[bid]||{};const bst=(s.board_state||{})[bid]||{};
+  const live=tel.live&&b.conn_state==='REGISTERED';const ack=bst.estop_ack==='true';
+  return '<div class="col4"><div class="sumcard'+(live?'':' off')+(bid===board?' sel':'')+'" data-tab="'+bid+'">'+
+   '<div class="row1"><span class="nm">'+bid+'</span><span class="stat"><span class="d"></span>'+(live?'ONLINE':'OFFLINE')+'</span></div>'+
+   '<div class="meta">'+(b.conn_state||'—')+' · fw '+(b.firmware_version||'—')+'</div>'+
+   '<div class="sumrow"><span>rate</span><b>'+fmt(tel.rate_hz,1)+' Hz</b></div>'+
+   '<div class="sumrow"><span>echo_value</span><b>'+((tel.values&&tel.values.echo_value)!==undefined?tel.values.echo_value:'--')+'</b></div>'+
+   '<div class="sumrow"><span>estop_ack</span><b'+(ack?' style="color:var(--warn)"':'')+'>'+(ack?'true':'false')+'</b></div>'+
+   '<div class="sumrow"><span>queue</span><b>'+(bst.queue_depth||'0')+'</b></div>'+
+   '</div></div>';
+ }).join('');
+ c.querySelectorAll('[data-tab]').forEach(card=>card.addEventListener('click',()=>selectBoard(card.dataset.tab)));
 }
 async function sendCmd(btn){
  const card=btn.closest('.cmd');const args={};
@@ -632,7 +687,10 @@ async function poll(){
  // safety banner
  const estop=(s.system_state||{}).estop_active==='true';el('safety').classList.toggle('on',estop);
  if(estop&&!lastEstop)pushAct('crit','E-STOP latched','system.estop_active=true');lastEstop=estop;
- // telemetry + board metrics
+ // board tabs + all-board summary, then per-board (active tab) detail
+ renderTabs(s.boards||[]);
+ renderSummary(s);
+ // telemetry + board metrics for the ACTIVE board (selected tab)
  const bid=board||(s.boards[0]&&s.boards[0].board_id);
  const tel=(s.telemetry||{})[bid]; const bst=(s.board_state||{})[bid]||{};
  const conn=((s.boards||[]).find(b=>b.board_id===bid)||{}).conn_state||'—';
@@ -645,7 +703,7 @@ async function poll(){
  if(bst.command_latency_p95_ms){el('m-lat').textContent=fmt(bst.command_latency_p95_ms,2);
   el('m-lat-ctx').textContent='p50 '+fmt(bst.command_latency_p50_ms,2)+' · p99 '+fmt(bst.command_latency_p99_ms,2);}
  renderDevice(bid,conn,live,tel,bst);
- renderRegisters(s.live_values||{});
+ renderRegisters(tel);
  // controller events into activity (dedupe by id)
  (s.events||[]).forEach(ev=>{const key=(ev.event||'')+ (ev.t||'');if(!poll._seen)poll._seen={};if(poll._seen[key])return;poll._seen[key]=1;
    pushAct(ev.event&&ev.event.indexOf('estop')>=0?'crit':'mut',ev.event||ev.type,JSON.stringify(ev.details||{}));});
@@ -670,10 +728,11 @@ function renderDevice(bid,conn,live,tel,bst){
   '<div><div class="k">Rate</div><div class="v">'+fmt(tel&&tel.rate_hz,1)+' Hz</div></div></div>'+
   '<div class="chips">'+chips.join('')+'</div></div>';
 }
-function renderRegisters(lv){
- const keys=Object.keys(lv).filter(k=>k!=='boards').sort();el('reg-count').textContent=keys.length+' fields';
- el('reg').innerHTML=keys.map(k=>'<tr><td class="k">'+k+'</td><td class="v">'+JSON.stringify(lv[k].value)+'</td><td class="s">'+lv[k].updated+'</td></tr>').join('')
-  ||'<tr><td class="muted" colspan="3" style="padding:14px 4px">send a command to populate</td></tr>';
+function renderRegisters(tel){
+ const vals=(tel&&tel.values)||{};const upd=(tel&&tel.updated)||'';
+ const keys=Object.keys(vals).sort();el('reg-count').textContent=keys.length+' fields';
+ el('reg').innerHTML=keys.map(k=>'<tr><td class="k">'+k+'</td><td class="v">'+JSON.stringify(vals[k])+'</td><td class="s">'+upd+'</td></tr>').join('')
+  ||'<tr><td class="muted" colspan="3" style="padding:14px 4px">waiting for telemetry…</td></tr>';
 }
 /* ---- canvas chart ---- */
 async function drawChart(){
