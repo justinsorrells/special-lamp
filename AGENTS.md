@@ -237,3 +237,6 @@ and whether it respects the two orthogonal axes (connection state vs
 `system.estop_active`). If a change would alter protocol behavior, treat it as a
 contract change: update `docs/contracts/V1_Networking_Decisions.md`, the tests,
 and this file together, or stop and ask the operator before coding.
+
+## Customization Rules
+* **Learning Notes**: When the user asks questions or queries for information, continuously generate and update markdown files to summarize the learning progress and answers for easy review. Always save these notes files in the `~/gemini_notes/` directory.

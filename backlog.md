@@ -1322,4 +1322,132 @@ General rules for every task:
   ```
   plus the recorded operator hardware integration run.
 
+---
+
+* [ ] Task: Author an expansive, study-grade codebase reference (one tab per Python file)
+
+  ## Goal
+
+  Produce a single, self-contained, browsable reference that documents the
+  **entire** codebase so it can be studied deeply, file by file and function by
+  function. This is **documentation only** — read-only authoring that explains the
+  existing code. It must not change behavior, contracts, or architecture, and it
+  must be faithful to the code as it actually exists at authoring time.
+
+  The intended experience: open one page, pick a Python file from a navigation
+  rail (one entry/"tab" per file), and read (a) a file-level overview, (b) the
+  architectural decisions embodied by that file, and (c) a per-function /
+  per-class breakdown where each item is a collapsible dropdown that explains the
+  unit in prose **and** shows its verbatim source.
+
+  ## Deliverable
+
+  * A self-contained HTML reference at `docs/codebase/index.html` (plus any
+    vendored assets it needs in `docs/codebase/`). **No external CDN / network
+    dependency** — it must render fully offline by double-clicking the file.
+  * Navigation rail with **one entry per Python file**, grouped so 25+ files stay
+    legible (suggested groups: **Core stack**, **Tools**, **Demos**, **Tests**).
+    Selecting an entry switches to that file's panel (tab-like). Include a
+    filter/search box that matches both file names and function/class names, plus
+    "expand all / collapse all" for the dropdowns in the active file.
+  * Stable anchors per file and per function (e.g. `#controller.py-_dispatch`) so
+    sections are linkable.
+
+  ## Per-file panel contents (the "expansive" part)
+
+  For **every** Python file in scope, the panel must contain:
+
+  1. **Overview** — what this module is for, where it sits in the command/telemetry
+     path, what it owns, and what depends on it. State the module's place in the
+     build order (`protocol` → `state` → `interfaces` → … ) and its dependency
+     direction.
+  2. **Architectural decisions for this file** — the design choices this file
+     embodies, each tied back to the governing source, **citing the contract
+     section** where one exists (e.g. pop-wins resolution → contract 1.8; two
+     orthogonal axes → contract 2; out-of-band e-stop under the per-board writer
+     lock → contract 1.19; terminal statuses `ok`/`error`/`timeout` → contract
+     3.12). Do **not** invent rationale: derive it from
+     `docs/contracts/V1_Networking_Decisions.md`, `AGENTS.md`, the relevant
+     `.agents/skills/*/SKILL.md`, and the code itself. Where a decision is the
+     author's inference rather than a documented contract, label it clearly as an
+     inference.
+  3. **Members** — one collapsible dropdown (`<details>`/`<summary>`) per public
+     and private function, method, and class. The summary shows the signature; the
+     opened body shows: a plain-language explanation of what it does and why,
+     notable invariants / edge cases / failure modes it handles, and the
+     **verbatim current source** of that unit (copy-faithful, including
+     decorators). Group methods under their class. Module-level constants, enums
+     (`StrEnum` vocabularies), and dataclasses get the same treatment.
+
+  ## Scope (files to cover)
+
+  The **entire** codebase. At authoring time that is, at minimum, every tracked
+  `*.py` outside `.venv`/caches:
+
+  * Core stack: `protocol.py`, `state.py`, `interfaces.py`, `board_connection.py`,
+    `controller.py`, `local_socket.py`, `observability.py`, `runtime.py`.
+  * Tools: `tools/check_invariants.py`, `tools/agent_orchestrator/orchestrate.py`.
+  * Demos: everything under `demos/`.
+  * Tests: everything under `tests/`.
+
+  Discover the file list at authoring time rather than trusting this list — if a
+  file exists and isn't covered, that's a gap.
+
+  ## Open decisions (resolve before/while implementing — flag for Justin)
+
+  1. **One-time authored artifact vs. a generator.** A generator (parse each file's
+     AST for the member list + verbatim source, inject authored prose from a
+     sidecar) keeps the source code in the page from rotting as the code changes;
+     a hand-authored HTML is simpler but goes stale the moment code moves.
+     Recommendation: a small generator for the **structure + verbatim source**,
+     with the **overview / architectural-decisions / per-function prose** kept in a
+     companion source (e.g. per-file Markdown or a data file) so authored
+     understanding survives regeneration. Decide how much to automate.
+  2. **Source freshness guard.** If any source is embedded by hand, how do we keep
+     it copy-faithful? (A regeneration step or a test that diffs embedded source
+     against the real files would prevent silent drift — see below.)
+  3. **Syntax highlighting** without a CDN: vendor a small highlighter locally, or
+     ship plain `<pre>` with monospace. Keep dependencies minimal and offline.
+  4. **Scope breadth:** full repo (incl. tests/demos) as above, or core stack only
+     with the rest summarized. Default here is full repo.
+
+  ## Do not implement / do not modify
+
+  * Do **not** change any `*.py` behavior, signatures, or comments to make
+    documentation easier — the code is the subject, not the target.
+  * Do **not** modify `docs/contracts/`, `AGENTS.md`, or `.agents/skills/`.
+  * Do **not** introduce new runtime dependencies for the controller; any tooling
+    deps for a generator stay dev-only and out of the command path.
+  * No architecture, protocol, status, or contract changes of any kind.
+
+  ## Validation
+
+  * The page renders offline (open `docs/codebase/index.html` directly) with no
+    network requests; navigation, filter, and dropdowns work.
+  * Every in-scope file has a panel; every function/method/class in those files has
+    a dropdown (spot-check a few files against `ast`/`grep` to confirm none are
+    missing).
+  * Embedded source is byte-faithful to the current files. If a generator or a
+    drift-check test is added, it passes; existing suite stays green:
+
+  ```bash
+  python -m pytest
+  python tools/check_invariants.py
+  ruff check .
+  mypy .
+  ```
+
+  (The repo build/lint/type commands are unaffected because no `*.py` behavior
+  changes; run them to prove the documentation work touched nothing it shouldn't.)
+
+  ## Preserve
+
+  * Frozen architecture and invariants are unchanged — this task only *describes*
+    them: client → Unix socket → controller → TCP → board; controller is sole
+    authority; Redis observability/read-replica only; terminal statuses only
+    `ok`/`error`/`timeout` with error codes for failure modes; `seq` vs
+    `board_seq` distinct; connection state ⟂ `system.estop_active`. The reference
+    must report these accurately and must not contradict
+    `docs/contracts/V1_Networking_Decisions.md` (it wins on any conflict).
+
 
